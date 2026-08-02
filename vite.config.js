@@ -27,17 +27,17 @@ export default defineConfig(({ mode }) => {
           lang: 'es',
           icons: [
             {
-              src: 'pwa-192x192.png',
+              src: 'frog-192x192.png',
               sizes: '192x192',
               type: 'image/png'
             },
             {
-              src: 'pwa-512x512.png',
+              src: 'frog-512x512.png',
               sizes: '512x512',
               type: 'image/png'
             },
             {
-              src: 'pwa-512x512-maskable.png',
+              src: 'frog-512x512-maskable.png',
               sizes: '512x512',
               type: 'image/png',
               purpose: 'maskable'
