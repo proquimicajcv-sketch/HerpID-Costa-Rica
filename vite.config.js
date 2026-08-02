@@ -1,5 +1,6 @@
 import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
+import { VitePWA } from 'vite-plugin-pwa'
 
 // https://vitejs.dev/config/
 export default defineConfig(({ mode }) => {
@@ -9,7 +10,41 @@ export default defineConfig(({ mode }) => {
 
   return {
     plugins: [
-      react()
+      react(),
+      VitePWA({
+        registerType: 'autoUpdate',
+        injectRegister: 'auto',
+        includeAssets: ['favicon.svg', 'icons.svg'],
+        manifest: {
+          name: 'HerpID Costa Rica',
+          short_name: 'HerpID CR',
+          description: 'Identificacion y reporte de herpetofauna en Costa Rica',
+          theme_color: '#0b5a53',
+          background_color: '#f2f7f4',
+          display: 'standalone',
+          start_url: basePath,
+          scope: basePath,
+          lang: 'es',
+          icons: [
+            {
+              src: 'pwa-192x192.png',
+              sizes: '192x192',
+              type: 'image/png'
+            },
+            {
+              src: 'pwa-512x512.png',
+              sizes: '512x512',
+              type: 'image/png'
+            },
+            {
+              src: 'pwa-512x512-maskable.png',
+              sizes: '512x512',
+              type: 'image/png',
+              purpose: 'maskable'
+            }
+          ]
+        }
+      })
     ],
     build: {
       rollupOptions: {
