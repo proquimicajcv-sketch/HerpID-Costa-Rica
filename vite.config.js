@@ -11,6 +11,17 @@ export default defineConfig(({ mode }) => {
     plugins: [
       react()
     ],
+    build: {
+      rollupOptions: {
+        output: {
+          manualChunks: {
+            react: ['react', 'react-dom'],
+            firebase: ['firebase/app', 'firebase/auth', 'firebase/firestore'],
+            mapas: ['leaflet', 'react-leaflet']
+          }
+        }
+      }
+    },
     base: basePath,
     server: {
       host: '0.0.0.0',
