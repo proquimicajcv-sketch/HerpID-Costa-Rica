@@ -1,0 +1,11 @@
+{
+  "name": "HerpID Costa Rica",
+  "forwardPorts": [3000],
+  "portsAttributes": {
+    "3000": {
+      "label": "HerpID App",
+      "onAutoForward": "openPreview",
+      "visibility": "public"
+    }
+  }
+}
