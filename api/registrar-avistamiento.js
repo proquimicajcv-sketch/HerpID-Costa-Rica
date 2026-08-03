@@ -18,6 +18,21 @@ function extensionFromContentType(contentType) {
   return 'jpg';
 }
 
+function esErrorBucketNoExiste(error) {
+  const msg = String(error?.message || '').toLowerCase();
+  const code = Number(error?.code || 0);
+  return code === 404 || msg.includes('no such bucket') || msg.includes('bucket') && msg.includes('not found');
+}
+
+function obtenerBucketsCandidatos() {
+  const projectId = String(process.env.FIREBASE_PROJECT_ID || '').trim();
+  const explicit = String(process.env.FIREBASE_STORAGE_BUCKET || '').trim();
+  const fromFirebasestorage = projectId ? `${projectId}.firebasestorage.app` : '';
+  const fromAppspot = projectId ? `${projectId}.appspot.com` : '';
+
+  return Array.from(new Set([explicit, fromFirebasestorage, fromAppspot].filter(Boolean)));
+}
+
 async function subirFotoDesdeDataUrl({ adminStorage, dataUrl, userId, index }) {
   const parsed = parseDataUrl(dataUrl);
   if (!parsed) return '';
@@ -30,21 +45,39 @@ async function subirFotoDesdeDataUrl({ adminStorage, dataUrl, userId, index }) {
   const objectPath = `avistamientos/${safeUserId}/${Date.now()}-${index}.${ext}`;
   const token = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-  const bucket = adminStorage.bucket();
-  const file = bucket.file(objectPath);
+  const bucketsCandidatos = obtenerBucketsCandidatos();
+  let ultimoError = null;
 
-  await file.save(buffer, {
-    resumable: false,
-    contentType: parsed.contentType,
-    metadata: {
-      cacheControl: 'public, max-age=31536000',
-      metadata: {
-        firebaseStorageDownloadTokens: token
+  for (const bucketName of bucketsCandidatos) {
+    try {
+      const bucket = adminStorage.bucket(bucketName);
+      const file = bucket.file(objectPath);
+
+      await file.save(buffer, {
+        resumable: false,
+        contentType: parsed.contentType,
+        metadata: {
+          cacheControl: 'public, max-age=31536000',
+          metadata: {
+            firebaseStorageDownloadTokens: token
+          }
+        }
+      });
+
+      return `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(objectPath)}?alt=media&token=${token}`;
+    } catch (error) {
+      ultimoError = error;
+      if (!esErrorBucketNoExiste(error)) {
+        throw error;
       }
     }
-  });
+  }
 
-  return `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(objectPath)}?alt=media&token=${token}`;
+  if (ultimoError) {
+    throw ultimoError;
+  }
+
+  throw new Error('No hay buckets configurados para Firebase Storage.');
 }
 
 async function normalizarFotosRegistro({ adminStorage, fotos, userId }) {

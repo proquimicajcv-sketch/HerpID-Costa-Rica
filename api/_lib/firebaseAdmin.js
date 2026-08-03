@@ -19,7 +19,7 @@ function getPrivateKey() {
 export function getFirebaseAdmin() {
   if (!getApps().length) {
     const projectId = requiredEnv('FIREBASE_PROJECT_ID');
-    const storageBucket = process.env.FIREBASE_STORAGE_BUCKET || `${projectId}.appspot.com`;
+    const storageBucket = process.env.FIREBASE_STORAGE_BUCKET || `${projectId}.firebasestorage.app`;
 
     initializeApp({
       credential: cert({
