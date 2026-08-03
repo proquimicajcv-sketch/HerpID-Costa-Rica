@@ -20,7 +20,7 @@ import { guardarBorradorLogin, cargarBorradorLogin, limpiarBorradorLogin, guarda
 import { estimarAltitudYTemperatura as estimarAltitudYTemperaturaDesdeServicio } from './utils/altitud';
 import { contarMensajesSinLeer } from './utils/mensajesChat';
 import { resolverEspeciesGuiaAutorizadas } from './utils/guiaHerpetologica';
-import { MAX_BYTES_IMAGEN_REPORTE, resolverConfiguracionCompresion, validarTamanoImagen, moverFotoEnLista, subirFotoConFallback } from './utils/imagenes';
+import { MAX_BYTES_IMAGEN_REPORTE, resolverConfiguracionCompresion, validarTamanoImagen, moverFotoEnLista } from './utils/imagenes';
 import { persistirAvistamientoConFallback } from './utils/reporteEnvio';
 
 /* --- DICCIONARIO DE CANTONES DE COSTA RICA (COORDENADAS, ALTITUD Y TEMPERATURA) --- */
@@ -2168,34 +2168,10 @@ export default function App() {
       const provinciaDetectada = buscarProvinciaEnTexto(textoUbicacion) || buscarProvinciaEnTexto(`${textoUbicacion} ${nombreComun} ${nombreCientifico}`) || 'San José';
 
       const fotosBase = fotosRegistro.slice(0, 3).filter(Boolean);
-      const fotosNormalizadas = [];
-      let fotosSinSubir = 0;
-      for (let i = 0; i < fotosBase.length; i += 1) {
-        const foto = fotosBase[i];
-        if (typeof foto === 'string' && foto.startsWith('data:image/')) {
-          const ruta = `avistamientos/${usuario.id || 'anonimo'}/${Date.now()}-${i}.jpg`;
-          const resultadoSubida = await subirFotoConFallback({
-            dataUrl: foto,
-            ruta,
-            subir: async ({ dataUrl, ruta: rutaDestino }) => {
-              const referenciaDestino = ref(storage, rutaDestino);
-              await uploadString(referenciaDestino, dataUrl, 'data_url');
-              return getDownloadURL(referenciaDestino);
-            }
-          });
-
-          if (typeof resultadoSubida.url === 'string' && resultadoSubida.url.startsWith('http')) {
-            fotosNormalizadas.push(resultadoSubida.url);
-          } else {
-            if (typeof resultadoSubida.url === 'string' && resultadoSubida.url.startsWith('data:image/')) {
-              fotosNormalizadas.push(resultadoSubida.url);
-            }
-            fotosSinSubir += 1;
-          }
-        } else {
-          fotosNormalizadas.push(foto);
-        }
-      }
+      const fotosNormalizadas = fotosBase
+        .map((foto) => String(foto || '').trim())
+        .filter(Boolean);
+      const fotosPendientesServidor = fotosNormalizadas.filter((foto) => foto.startsWith('data:image/')).length;
 
       if (fotosNormalizadas.length === 0) {
         throw new Error('⚠️ No se pudieron subir las fotos al almacenamiento. Revisa tu conexión e inténtalo de nuevo con imágenes más livianas.');
@@ -2239,7 +2215,7 @@ export default function App() {
         fotoPrincipalIndex,
         coords: [latFinal, lngFinal],
         createdAt: Date.now(),
-        fotoSubidaAFirebase: fotosSinSubir === 0
+        fotoSubidaAFirebase: fotosPendientesServidor === 0
       };
 
       const resultado = await persistirAvistamientoConFallback({
