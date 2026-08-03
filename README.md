@@ -68,3 +68,33 @@ Para obtener VERCEL_ORG_ID y VERCEL_PROJECT_ID de forma rapida desde terminal:
 1. Ejecuta: npx vercel link
 2. Revisa el archivo .vercel/project.json
 3. Copia orgId como VERCEL_ORG_ID y projectId como VERCEL_PROJECT_ID
+
+## Recuperacion de contrasena por correo o celular
+
+La app ahora incluye dos rutas de recuperacion:
+
+- Si el usuario escribe correo, se envia el enlace de recuperacion por Firebase Auth.
+- Si el usuario escribe celular, se intenta enviar un SMS con enlace de recuperacion desde el endpoint `/api/send-reset-sms`.
+
+Para que el SMS funcione en Vercel, configura estas variables de entorno:
+
+- FIREBASE_PROJECT_ID
+- FIREBASE_CLIENT_EMAIL
+- FIREBASE_PRIVATE_KEY
+- TWILIO_ACCOUNT_SID
+- TWILIO_AUTH_TOKEN
+- TWILIO_FROM_NUMBER
+- PASSWORD_RESET_CONTINUE_URL (opcional)
+
+Notas:
+
+- El telefono se busca en la coleccion `usuarios` por el campo `telefono`.
+- Si el servicio SMS no esta disponible, la app hace fallback y envia la recuperacion al correo vinculado al celular.
+
+### Configuracion rapida
+
+1. Copia `.env.example` como `.env.local`.
+2. Completa credenciales de Firebase Admin y Twilio.
+3. Ejecuta `npm run check:sms-config` para validar variables.
+4. En Vercel, agrega las mismas variables en Project Settings > Environment Variables.
+5. Despliega y prueba el flujo desde la opcion "¿Olvidaste tu contrasena?".

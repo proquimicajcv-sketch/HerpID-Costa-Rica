@@ -6,15 +6,22 @@ import 'leaflet/dist/leaflet.css';
 /* --- CONEXIÓN CON FIREBASE --- */
 import { db, auth, storage } from './firebase';
 import { collection, addDoc, getDocs, doc, updateDoc, deleteDoc, onSnapshot, setDoc, getDoc, query, orderBy, limit, where } from 'firebase/firestore';
-import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, setPersistence, browserLocalPersistence } from 'firebase/auth';
+import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, setPersistence, browserLocalPersistence, sendPasswordResetEmail } from 'firebase/auth';
 import { ref, uploadString, getDownloadURL } from 'firebase/storage';
 import { esRegistroVisibleEnMapa, esRegistroValidado, puedeVerReportesEnMapa } from './utils/registroVisibilidad';
 import { detectarSubidaRanking } from './utils/ranking';
 import { crearDatosUsuarioFirestore } from './utils/usuarioFirestore';
+import { resolverDestinoEliminacionCuenta } from './utils/usuarioCuenta';
+import { validarRegistroContacto } from './utils/registroContacto';
+import { generarCodigoRecuperacion, normalizarContactoRecuperacion } from './utils/recuperacionCuenta';
 import { esUsuarioAdministrativo, esUsuarioProtegido, esUsuarioPrincipal, coincideIdentidadUsuario } from './utils/usuarioIdentidad';
+import { normalizarContactoBaneo, construirMensajeBaneo } from './utils/baneos';
 import { guardarBorradorLogin, cargarBorradorLogin, limpiarBorradorLogin, guardarBorradorReporte, cargarBorradorReporte, limpiarBorradorReporte, guardarFaqImagenes, cargarFaqImagenes } from './utils/draftStorage';
 import { estimarAltitudYTemperatura as estimarAltitudYTemperaturaDesdeServicio } from './utils/altitud';
 import { contarMensajesSinLeer } from './utils/mensajesChat';
+import { resolverEspeciesGuiaAutorizadas } from './utils/guiaHerpetologica';
+import { MAX_BYTES_IMAGEN_REPORTE, resolverConfiguracionCompresion, validarTamanoImagen, moverFotoEnLista, subirFotoConFallback } from './utils/imagenes';
+import { persistirAvistamientoConFallback } from './utils/reporteEnvio';
 
 /* --- DICCIONARIO DE CANTONES DE COSTA RICA (COORDENADAS, ALTITUD Y TEMPERATURA) --- */
 const cantonesCR = {
@@ -383,26 +390,65 @@ const renderizarInsigniaUsuario = (validados) => {
 };
 
 /* Selector interactivo de mapa */
-function EventoMapaPin({ setLat, setLng, setPosPin, setTemp, setAltitud }) {
+function EventoMapaPin({ setLat, setLng, setPosPin, setTemp, setAltitud, setComunidad, setErrorEnvio }) {
   const map = useMap();
 
   useEffect(() => {
     const manejarClick = async (e) => {
-      const latFija = e.latlng.lat.toFixed(6);
-      const lngFija = e.latlng.lng.toFixed(6);
+      const lat = e.latlng.lat;
+      const lng = e.latlng.lng;
+      const latFija = lat.toFixed(6);
+      const lngFija = lng.toFixed(6);
       setLat(latFija);
       setLng(lngFija);
-      setPosPin([e.latlng.lat, e.latlng.lng]);
-      const { altitud: altEstimada, temperatura: tempEstimada } = await estimarAltitudYTemperaturaDesdeServicio(e.latlng.lat, e.latlng.lng);
-      setTemp(tempEstimada);
-      setAltitud(altEstimada);
+      setPosPin([lat, lng]);
+      setComunidad(`Ubicación señalada en el mapa • ${latFija}, ${lngFija}`);
+      setErrorEnvio('');
+      try {
+        const { altitud: altEstimada, temperatura: tempEstimada } = await estimarAltitudYTemperaturaDesdeServicio(lat, lng);
+        setTemp(tempEstimada);
+        setAltitud(altEstimada);
+      } catch (error) {
+        setTemp('—');
+        setAltitud('—');
+      }
     };
 
     map.on('click', manejarClick);
     return () => map.off('click', manejarClick);
-  }, [map, setLat, setLng, setPosPin, setTemp, setAltitud]);
+  }, [map, setLat, setLng, setPosPin, setTemp, setAltitud, setComunidad, setErrorEnvio]);
 
   return null;
+}
+
+function MarcadorMapaInteractivo({ posPin, setLat, setLng, setPosPin, setTemp, setAltitud, setComunidad, setErrorEnvio }) {
+  const manejarArrastre = async (event) => {
+    const { lat, lng } = event.target.getLatLng();
+    const latFija = lat.toFixed(6);
+    const lngFija = lng.toFixed(6);
+    setLat(latFija);
+    setLng(lngFija);
+    setPosPin([lat, lng]);
+    setComunidad(`Ubicación señalada en el mapa • ${latFija}, ${lngFija}`);
+    setErrorEnvio('');
+    try {
+      const { altitud: altEstimada, temperatura: tempEstimada } = await estimarAltitudYTemperaturaDesdeServicio(lat, lng);
+      setTemp(tempEstimada);
+      setAltitud(altEstimada);
+    } catch (error) {
+      setTemp('—');
+      setAltitud('—');
+    }
+  };
+
+  return (
+    <Marker
+      position={posPin}
+      icon={iconoAlfilerRojo}
+      draggable={true}
+      eventHandlers={{ dragend: manejarArrastre }}
+    />
+  );
 }
 
 function ControladorZoomMapa({ setZoomMapa }) {
@@ -495,12 +541,20 @@ export default function App() {
 
   const [vistaPerfil, setVistaPerfil] = useState('login');
   const [formLogin, setFormLogin] = useState(() => cargarBorradorLogin());
-  const [formReg, setFormReg] = useState({ nombre: '', emailOrTel: '', pass: '' });
+  const [formReg, setFormReg] = useState({ nombre: '', emailOrTel: '', correoRecuperacion: '', pass: '' });
+  const [formRecuperacion, setFormRecuperacion] = useState({ emailOrTel: '' });
+  const [codigoRecuperacion, setCodigoRecuperacion] = useState('');
+  const [codigoRecuperacionEnviado, setCodigoRecuperacionEnviado] = useState(false);
+  const [codigoTemporal, setCodigoTemporal] = useState('');
+  const [nuevaContrasena, setNuevaContrasena] = useState('');
+  const [codigoVerificado, setCodigoVerificado] = useState(false);
+  const [emailRecuperacion, setEmailRecuperacion] = useState('');
   const [mostrarPassLogin, setMostrarPassLogin] = useState(false);
   const [mostrarPassRegistro, setMostrarPassRegistro] = useState(false);
   const [busquedaGuia, setBusquedaGuia] = useState('');
   const [busquedaAdmin, setBusquedaAdmin] = useState('');
   const [errorEnvio, setErrorEnvio] = useState('');
+  const [enviandoReporte, setEnviandoReporte] = useState(false);
 
   const [editandoNombrePerfil, setEditandoNombrePerfil] = useState(false);
   const [nuevoNombrePerfil, setNuevoNombrePerfil] = useState('');
@@ -986,25 +1040,27 @@ export default function App() {
   }, [esAdminOExperto]);
 
   const especiesGuiaDefecto = [
-    { nombre: 'Rana Calzonuda', especie: 'Agalychnis callidryas', tipo: 'Anfibio', esPeligroso: false, img: 'https://images.unsplash.com/photo-1534567153574-2b12153a87f0?w=500', desc: 'Emblemática rana de ojos rojos y costados azulados de los bosques húmedos.' },
-    { nombre: 'Terciopelo', especie: 'Bothrops asper', tipo: 'Reptil', esPeligroso: true, img: 'https://images.unsplash.com/photo-1531386151447-fd76ad50012f?w=500', desc: 'Serpiente víbora venenosa de gran tamaño e importancia médica severa.' },
-    { nombre: 'Garrita / Sapo del Pacífico', especie: 'Incilius aucoinae', tipo: 'Anfibio', esPeligroso: false, img: 'https://images.unsplash.com/photo-1508685096489-7aacd43bd3b1?w=500', desc: 'Sapo común de tierras bajas del Pacífico Sur costarricense.' },
-    { nombre: 'Gallego / Basilisco Verde', especie: 'Basiliscus basiliscus', tipo: 'Reptil', esPeligroso: false, img: 'https://images.unsplash.com/photo-1504450758481-7338eba7524a?w=500', desc: 'Lagarto capaz de correr distancias cortas sobre el agua.' }
+    { nombre: 'Rana Calzonuda', especie: 'Agalychnis callidryas', tipo: 'Anfibio', esPeligroso: false, img: 'https://images.unsplash.com/photo-1534567153574-2b12153a87f0?w=500', desc: 'Emblemática rana de ojos rojos y costados azulados de los bosques húmedos.', autorizadoPor: 'admin' },
+    { nombre: 'Terciopelo', especie: 'Bothrops asper', tipo: 'Reptil', esPeligroso: true, img: 'https://images.unsplash.com/photo-1531386151447-fd76ad50012f?w=500', desc: 'Serpiente víbora venenosa de gran tamaño e importancia médica severa.', autorizadoPor: 'admin' },
+    { nombre: 'Garrita / Sapo del Pacífico', especie: 'Incilius aucoinae', tipo: 'Anfibio', esPeligroso: false, img: 'https://images.unsplash.com/photo-1508685096489-7aacd43bd3b1?w=500', desc: 'Sapo común de tierras bajas del Pacífico Sur costarricense.', autorizadoPor: 'admin' },
+    { nombre: 'Gallego / Basilisco Verde', especie: 'Basiliscus basiliscus', tipo: 'Reptil', esPeligroso: false, img: 'https://images.unsplash.com/photo-1504450758481-7338eba7524a?w=500', desc: 'Lagarto capaz de correr distancias cortas sobre el agua.', autorizadoPor: 'admin' }
   ];
 
   const cargarGuiaNube = async () => {
     try {
       const querySnapshot = await getDocs(collection(db, 'especies_guia'));
       const lista = querySnapshot.docs.map(d => ({ ...d.data(), id: d.id }));
-      
-      if (lista.length === 0) {
+      const autorizadas = resolverEspeciesGuiaAutorizadas(lista);
+
+      if (autorizadas.length === 0) {
         for (const esp of especiesGuiaDefecto) {
-          await addDoc(collection(db, 'especies_guia'), esp);
+          await addDoc(collection(db, 'especies_guia'), { ...esp, autorizadoPor: 'admin' });
         }
-        cargarGuiaNube();
-      } else {
-        setEspeciesGuia(lista);
+        await cargarGuiaNube();
+        return;
       }
+
+      setEspeciesGuia(autorizadas);
     } catch (e) {
       setEspeciesGuia(especiesGuiaDefecto);
     }
@@ -1222,6 +1278,47 @@ export default function App() {
     });
   };
 
+  const actualizarEstadoBaneoUsuario = async (userId, userData, baneado) => {
+    if (!esAdmin) return alert('⛔ Solo los Administradores pueden gestionar bloqueos.');
+    if (userData?.email?.toLowerCase() === 'proquimicajcv@icloud.com' || userId === 'admin_jcv_master') {
+      return alert('⛔ El Administrador General no puede ser suspendido.');
+    }
+
+    const motivo = baneado ? prompt('Escribe el motivo del bloqueo:', 'Violación de las reglas de la comunidad') : '';
+    if (baneado && (!motivo || !motivo.trim())) return;
+
+    try {
+      const motivoNormalizado = motivo ? motivo.trim() : '';
+      const contacto = normalizarContactoBaneo(userData?.email || userData?.telefono || '');
+      const mensaje = baneado ? construirMensajeBaneo(motivoNormalizado) : '';
+
+      await updateDoc(doc(db, 'usuarios', userId), {
+        baneado,
+        motivoBaneo: baneado ? motivoNormalizado : '',
+        mensajeBaneo: baneado ? mensaje : '',
+        fechaBaneo: baneado ? new Date().toISOString() : '',
+        baneoPor: baneado ? (usuario?.email || 'admin') : ''
+      });
+
+      if (baneado && contacto) {
+        try {
+          await fetch('/api/notificar-baneo', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ contacto, motivo: motivoNormalizado, uid: userId })
+          });
+        } catch (e) {
+          console.warn('No fue posible enviar la notificación de baneo:', e);
+        }
+      }
+
+      alert(baneado ? '🚫 Usuario bloqueado correctamente.' : '✅ El bloqueo fue removido.');
+    } catch (e) {
+      console.error('Error al actualizar el estado de baneo:', e);
+      alert('Error al actualizar el bloqueo del usuario.');
+    }
+  };
+
   const cambiarRangoUsuario = async (userId, userEmail, nuevoRol) => {
     if (!esAdminMaster) return alert('⛔ Solo el Administrador General puede cambiar rangos.');
     if (userEmail.toLowerCase() === 'proquimicajcv@icloud.com') {
@@ -1255,11 +1352,24 @@ export default function App() {
       return alert('⛔ No se puede eliminar al Administrador General.');
     }
     if (!window.confirm('⚠️ ¿Estás seguro de eliminar permanentemente a este usuario regular del sistema?')) return;
+
     try {
-      await deleteDoc(doc(db, 'usuarios', userId));
-      alert('🗑️ Usuario regular eliminado correctamente.');
+      const destino = resolverDestinoEliminacionCuenta({ uid: userId, email: userEmail });
+      const res = await fetch('/api/eliminar-cuenta', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(destino)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data?.error || 'No fue posible eliminar la cuenta de autenticación.');
+      }
+
+      await deleteDoc(doc(db, 'usuarios', destino.uid));
+      alert('🗑️ Usuario regular eliminado correctamente. Podrá crear otra cuenta si necesita acceder nuevamente.');
     } catch (e) {
-      alert('Error al eliminar el usuario de la base de datos.');
+      console.error('Error al eliminar usuario regular:', e);
+      alert('Error al eliminar usuario. Revisa que la cuenta exista y vuelve a intentarlo.');
     }
   };
 
@@ -1410,10 +1520,21 @@ export default function App() {
   };
 
   const handleImagenChatUpload = async (e) => {
-    const file = e.target.files[0];
-    if (file) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const validacion = validarTamanoImagen(file);
+    if (!validacion.valido) {
+      alert(validacion.motivo);
+      if (e?.target) e.target.value = '';
+      return;
+    }
+
+    try {
       const comprimida = await comprimirImagen(file);
       setImagenChat(comprimida);
+    } catch (error) {
+      alert(error.message || 'No se pudo procesar la imagen.');
     }
   };
 
@@ -1471,7 +1592,6 @@ export default function App() {
     setEsPeligrosoReporte(borrador.esPeligrosoReporte || false);
     setNombreCientifico(borrador.nombreCientifico || '');
     setNombreComun(borrador.nombreComun || '');
-    setComunidad(borrador.comunidad || '');
     setEstadoOrganismo(borrador.estadoOrganismo || 'Vivo / Activo');
     setEtapa(borrador.etapa || 'Adulto');
     setMicrohabitat(borrador.microhabitat || 'Vegetación / Finca Cafetalera');
@@ -1484,15 +1604,18 @@ export default function App() {
         : Math.max(0, Math.min(indiceBorrador, fotosBorrador.length - 1))
     );
     setAudioURL(borrador.audioURL || null);
-    setLat(borrador.lat || '9.650746');
-    setLng(borrador.lng || '-84.000193');
-    setPosPin(borrador.posPin || [9.650746, -84.000193]);
+    const latInicial = Number(borrador.lat || '9.650746');
+    const lngInicial = Number(borrador.lng || '-84.000193');
+    setLat(String(latInicial.toFixed(6)));
+    setLng(String(lngInicial.toFixed(6)));
+    setPosPin(borrador.posPin || [latInicial, lngInicial]);
     setTemp(borrador.temp || '21,5');
     setAltitud(borrador.altitud || '1450');
     setAutorizaNombrePublico(true);
     setUsarFechaActualAvistamiento(true);
     setFechaHoraAvistamiento(formatearFechaInputLocal(Date.now()));
     setErrorEnvio('');
+    setComunidad(borrador.comunidad || '');
     setModalRegistro(true);
   };
 
@@ -1518,29 +1641,6 @@ export default function App() {
       audioURL
     });
   }, [tipoFauna, silueta, desconocido, esPeligrosoReporte, nombreCientifico, nombreComun, lat, lng, posPin, comunidad, estadoOrganismo, etapa, temp, altitud, microhabitat, fotosRegistro, fotoPrincipalIndex, audioURL]);
-
-  const obtenerUbicacionGPS = () => {
-    if ('geolocation' in navigator) {
-      navigator.geolocation.getCurrentPosition(
-        async (pos) => {
-          const latGps = pos.coords.latitude.toFixed(6);
-          const lngGps = pos.coords.longitude.toFixed(6);
-          setLat(latGps);
-          setLng(lngGps);
-          setPosPin([pos.coords.latitude, pos.coords.longitude]);
-          const { altitud: altEstimada, temperatura: tempEstimada } = await estimarAltitudYTemperaturaDesdeServicio(pos.coords.latitude, pos.coords.longitude);
-          setTemp(tempEstimada);
-          setAltitud(altEstimada);
-          alert('📍 GPS detectado correctamente.');
-        },
-        () => {
-          alert('No se pudo obtener el GPS automáticamente. Puedes marcar el punto manualmente en el mapa.');
-        }
-      );
-    } else {
-      alert('Geolocalización no soportada en este navegador.');
-    }
-  };
 
   const iniciarGrabacion = async () => {
     if (grabandoAudio) return;
@@ -1611,17 +1711,33 @@ export default function App() {
   };
 
   const comprimirImagen = (file) => {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
+      const validacion = validarTamanoImagen(file);
+      if (!validacion.valido) {
+        reject(new Error(validacion.motivo));
+        return;
+      }
+
       const reader = new FileReader();
       reader.readAsDataURL(file);
       reader.onload = (event) => {
         const img = new Image();
         img.src = event.target.result;
         img.onload = () => {
+          let configuracion = resolverConfiguracionCompresion(file.size);
           const canvas = document.createElement('canvas');
-          const MAX_SIZE = 800;
+          const maxBytesObjetivo = configuracion.maxBytesFinal || MAX_BYTES_IMAGEN_REPORTE;
+          const MAX_SIZE = configuracion.maxDimension || 1500;
           let width = img.width;
           let height = img.height;
+          let calidad = 1;
+          let escala = 1;
+          if (configuracion.debeReducir) {
+            calidad = configuracion.quality;
+            escala = configuracion.scale;
+            width = Math.max(1, Math.floor(width * escala));
+            height = Math.max(1, Math.floor(height * escala));
+          }
           if (width > height) {
             if (width > MAX_SIZE) { height = MAX_SIZE * height / width; width = MAX_SIZE; }
           } else {
@@ -1631,9 +1747,20 @@ export default function App() {
           canvas.height = height;
           const ctx = canvas.getContext('2d');
           ctx.drawImage(img, 0, 0, width, height);
-          resolve(canvas.toDataURL('image/jpeg', 0.6));
+
+          let dataUrl = canvas.toDataURL('image/jpeg', calidad);
+          let intentos = 0;
+          while (dataUrl.length > maxBytesObjetivo && intentos < 10) {
+            calidad = Math.max(0.42, calidad - 0.08);
+            dataUrl = canvas.toDataURL('image/jpeg', calidad);
+            intentos += 1;
+          }
+
+          resolve(dataUrl);
         };
+        img.onerror = () => reject(new Error('No se pudo leer la imagen.'));
       };
+      reader.onerror = () => reject(new Error('No se pudo procesar la imagen.'));
     });
   };
 
@@ -1642,6 +1769,13 @@ export default function App() {
 
     const file = event?.target?.files?.[0];
     if (!file) return;
+
+    const validacion = validarTamanoImagen(file);
+    if (!validacion.valido) {
+      alert(validacion.motivo);
+      if (event?.target) event.target.value = '';
+      return;
+    }
 
     try {
       const contenido = await comprimirImagen(file);
@@ -1685,25 +1819,23 @@ export default function App() {
     const files = Array.from(e.target.files || []);
     if (files.length > 0) {
       try {
-        const fotosCargadas = await Promise.all(files.slice(0, 3).map(async (file) => {
+        const fotosPrevisualizadas = await Promise.all(files.slice(0, 3).map(async (file) => {
           const comprimida = await comprimirImagen(file);
-          const nombreSeguro = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-          const ruta = `avistamientos/${usuario.id || 'anonimo'}/${Date.now()}-${nombreSeguro}`;
-          const referencia = ref(storage, ruta);
-          await uploadString(referencia, comprimida, 'data_url');
-          return getDownloadURL(referencia);
+          return comprimida;
         }));
 
         setFotosRegistro((prev) => {
-          const nuevasFotos = [...prev, ...fotosCargadas].slice(0, 3);
+          const nuevasFotos = [...prev, ...fotosPrevisualizadas].slice(0, 3);
           setFotoPrincipalIndex((prevIdx) => Math.min(prevIdx, Math.max(0, nuevasFotos.length - 1)));
           return nuevasFotos;
         });
         setErrorEnvio('');
       } catch (error) {
-        setErrorEnvio('No se pudieron subir las fotos. Intenta de nuevo con otra conexión o imágenes más livianas.');
+        setErrorEnvio(error.message || 'No se pudieron preparar las fotos. Intenta de nuevo con otra imagen.');
       }
     }
+
+    if (e?.target) e.target.value = '';
   };
 
   const eliminarFotoRegistro = (indiceFoto) => {
@@ -1716,6 +1848,15 @@ export default function App() {
         return Math.min(prevPrincipal, fotosActuales.length - 1);
       });
       return fotosActuales;
+    });
+  };
+
+  const moverFotoRegistro = (indiceFoto, direccion) => {
+    setFotosRegistro((prev) => {
+      const siguienteIndex = indiceFoto + direccion;
+      if (siguienteIndex < 0 || siguienteIndex >= prev.length) return prev;
+      const nuevasFotos = moverFotoEnLista(prev, indiceFoto, siguienteIndex);
+      return nuevasFotos;
     });
   };
 
@@ -1756,6 +1897,13 @@ export default function App() {
     const file = e.target.files?.[0] || e?.dataTransfer?.files?.[0];
     if (!file) return;
 
+    const validacion = validarTamanoImagen(file);
+    if (!validacion.valido) {
+      alert(validacion.motivo);
+      if (e?.target) e.target.value = '';
+      return;
+    }
+
     if (!usuario.isLoggedIn || !usuario.id) {
       alert('Inicia sesión para personalizar tu logo.');
       e.target.value = '';
@@ -1789,12 +1937,13 @@ export default function App() {
       return alert('Debe completar al menos el Nombre Común y Nombre Científico.');
     }
     const nueva = {
-      nombre: formGuia.nombre,
-      especie: formGuia.especie,
+      nombre: formGuia.nombre.trim(),
+      especie: formGuia.especie.trim(),
       tipo: formGuia.tipo,
       esPeligroso: formGuia.esPeligroso,
       img: formGuia.img || 'https://images.unsplash.com/photo-1534567153574-2b12153a87f0?w=500',
-      desc: formGuia.desc || 'Especie registrada en la guía oficial.'
+      desc: formGuia.desc || 'Especie registrada en la guía oficial.',
+      autorizadoPor: 'admin'
     };
     try {
       await addDoc(collection(db, 'especies_guia'), nueva);
@@ -1813,12 +1962,13 @@ export default function App() {
     try {
       const docRef = doc(db, 'especies_guia', especieGuiaEditando.id);
       await updateDoc(docRef, {
-        nombre: especieGuiaEditando.nombre,
-        especie: especieGuiaEditando.especie,
+        nombre: especieGuiaEditando.nombre.trim(),
+        especie: especieGuiaEditando.especie.trim(),
         tipo: especieGuiaEditando.tipo,
         esPeligroso: especieGuiaEditando.esPeligroso || false,
         img: especieGuiaEditando.img,
-        desc: especieGuiaEditando.desc
+        desc: especieGuiaEditando.desc,
+        autorizadoPor: 'admin'
       });
       await cargarGuiaNube();
       alert('¡Ficha de la Guía actualizada!');
@@ -1987,7 +2137,157 @@ export default function App() {
     a.click();
   };
 
-  const especiesFiltradasGuia = especiesGuia.filter(e => 
+  const enviarReporteCientifico = async () => {
+    if (enviandoReporte) return;
+    setErrorEnvio('');
+
+    const fotosAdjuntas = fotosRegistro.filter(Boolean).length;
+    if (fotosAdjuntas === 0) {
+      const mensaje = '⚠️ Debes adjuntar al menos una fotografía para enviar el reporte.';
+      setErrorEnvio(mensaje);
+      alert(mensaje);
+      return;
+    }
+
+    setEnviandoReporte(true);
+
+    try {
+      const fechaEventoMs = usarFechaActualAvistamiento
+        ? Date.now()
+        : (parsearFechaInputLocal(fechaHoraAvistamiento) || Date.now());
+      const fechaEventoTexto = new Date(fechaEventoMs).toLocaleString('es-CR', { timeZone: 'America/Costa_Rica' });
+
+      const nombreReportante = usuario.isLoggedIn
+        ? (usuario.nombre || usuario.email)
+        : 'Usuario Anónimo';
+      const latNumero = Number(lat);
+      const lngNumero = Number(lng);
+      const latFinal = Number.isFinite(latNumero) ? latNumero : 9.650746;
+      const lngFinal = Number.isFinite(lngNumero) ? lngNumero : -84.000193;
+      const textoUbicacion = `Ubicación por pin del mapa • ${latFinal.toFixed(6)}, ${lngFinal.toFixed(6)}`;
+      const provinciaDetectada = buscarProvinciaEnTexto(textoUbicacion) || buscarProvinciaEnTexto(`${textoUbicacion} ${nombreComun} ${nombreCientifico}`) || 'San José';
+
+      const fotosBase = fotosRegistro.slice(0, 3).filter(Boolean);
+      const fotosNormalizadas = [];
+      let fotosSinSubir = 0;
+      for (let i = 0; i < fotosBase.length; i += 1) {
+        const foto = fotosBase[i];
+        if (typeof foto === 'string' && foto.startsWith('data:image/')) {
+          const ruta = `avistamientos/${usuario.id || 'anonimo'}/${Date.now()}-${i}.jpg`;
+          const resultadoSubida = await subirFotoConFallback({
+            dataUrl: foto,
+            ruta,
+            subir: async ({ dataUrl, ruta: rutaDestino }) => {
+              const referenciaDestino = ref(storage, rutaDestino);
+              await uploadString(referenciaDestino, dataUrl, 'data_url');
+              return getDownloadURL(referenciaDestino);
+            }
+          });
+
+          if (typeof resultadoSubida.url === 'string' && resultadoSubida.url.startsWith('http')) {
+            fotosNormalizadas.push(resultadoSubida.url);
+          } else {
+            fotosSinSubir += 1;
+          }
+        } else {
+          fotosNormalizadas.push(foto);
+        }
+      }
+
+      if (fotosNormalizadas.length === 0) {
+        throw new Error('⚠️ No se pudieron subir las fotos al almacenamiento. Revisa tu conexión e inténtalo de nuevo con imágenes más livianas.');
+      }
+
+      const fotoInicial = fotosNormalizadas[fotoPrincipalIndex] || fotosNormalizadas[0] || '';
+      const fotosOrdenadas = [
+        fotoInicial,
+        ...fotosNormalizadas.filter((f) => f && f !== fotoInicial)
+      ].filter(Boolean).slice(0, 3);
+
+      if (fotosOrdenadas.length === 0 || !fotoInicial) {
+        throw new Error('⚠️ No se pudo confirmar una foto válida para el reporte. Vuelve a cargar la imagen e inténtalo de nuevo.');
+      }
+
+      const nuevo = {
+        userId: usuario.id || null,
+        userEmail: usuario.email || null,
+        nombreComun: desconocido ? 'Desconocido (Por verificar)' : (nombreComun || 'Avistamiento'),
+        especie: desconocido ? 'Especie por verificar' : (nombreCientifico || nombreComun),
+        categoria: tipoFauna.toUpperCase(),
+        silueta: silueta,
+        esPeligroso: esPeligrosoReporte,
+        estado: 'EN REVISIÓN EXPERTA',
+        ubicacion: textoUbicacion,
+        provincia: provinciaDetectada,
+        reportante: nombreReportante,
+        autorizaNombrePublico,
+        temp: `${temp} °C`,
+        altitud: `${altitud} msnm`,
+        microhabitat: microhabitat,
+        estadoVida: `${estadoOrganismo} (${etapa})`,
+        horaRegistro: fechaEventoTexto,
+        fechaAvistamiento: fechaEventoTexto,
+        fechaAvistamientoMs: fechaEventoMs,
+        fechaAvistamientoManual: !usarFechaActualAvistamiento,
+        audioURL: audioURL || null,
+        fotos: fotosOrdenadas,
+        fotoAutorizada: fotoInicial || null,
+        img: fotoInicial || null,
+        fotoPrincipalIndex,
+        coords: [latFinal, lngFinal],
+        createdAt: Date.now(),
+        fotoSubidaAFirebase: fotosSinSubir === 0
+      };
+
+      const resultado = await persistirAvistamientoConFallback({
+        payload: nuevo,
+        guardarRemoto: async (payload) => {
+          const docRef = await addDoc(collection(db, 'avistamientos'), payload);
+          return { ok: true, id: docRef?.id || null };
+        },
+        guardarDirecto: async (payload) => {
+          const response = await fetch('/api/registrar-avistamiento', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+
+          const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+          const esJson = contentType.includes('application/json');
+          const data = esJson ? await response.json().catch(() => ({})) : {};
+          if (!response.ok) {
+            throw new Error(data?.error || 'No fue posible registrar el avistamiento en el backend.');
+          }
+
+          if (!esJson || data?.ok !== true) {
+            throw new Error('Respuesta inválida del backend al registrar el avistamiento.');
+          }
+
+          return { ok: true, id: data?.id || null };
+        }
+      });
+
+      if (!resultado?.ok) {
+        throw new Error('No se pudo guardar el reporte.');
+      }
+
+      limpiarBorradorReporte();
+      if (resultado?.guardadoLocal) {
+        alert('⚠️ El reporte se guardó localmente por un problema de conexión y se enviará cuando el servicio se restablezca.');
+      } else {
+        alert(`¡Avistamiento enviado a revisión experta por parte de ${nombreReportante}!`);
+      }
+      setModalRegistro(false);
+    } catch (e) {
+      const mensajeError = e?.message || 'Error al enviar el reporte a la nube.';
+      setErrorEnvio(mensajeError);
+      alert(mensajeError);
+    } finally {
+      setEnviandoReporte(false);
+    }
+  };
+
+const especiesFiltradasGuia = resolverEspeciesGuiaAutorizadas(especiesGuia).filter((e) =>
     (e.nombre && e.nombre.toLowerCase().includes(busquedaGuia.toLowerCase())) || 
     (e.especie && e.especie.toLowerCase().includes(busquedaGuia.toLowerCase()))
   );
@@ -2087,14 +2387,70 @@ export default function App() {
     return `tel_${soloNumeros}@herpid.cr`;
   };
 
+  const normalizarTelefono = (input) => {
+    return String(input || '').replace(/\D/g, '');
+  };
+
+  const obtenerEmailAsociadoCelular = async (celular) => {
+    const telefono = normalizarTelefono(celular);
+    if (!telefono) return '';
+
+    const snap = await getDocs(
+      query(collection(db, 'usuarios'), where('telefono', '==', telefono), limit(1))
+    );
+
+    if (snap.empty) return '';
+
+    const data = snap.docs[0].data() || {};
+    const email = String(data.email || '').trim().toLowerCase();
+    if (!email || !email.includes('@')) return '';
+    return email;
+  };
+
+  const resolverCredencialLogin = async (input) => {
+    const limpio = String(input || '').trim();
+    if (!limpio) return '';
+
+    if (limpio.toLowerCase() === 'proquimicajcv@icloud.com') {
+      return limpio.toLowerCase();
+    }
+
+    if (limpio.includes('@')) {
+      return limpio.toLowerCase();
+    }
+
+    const emailAsociado = await obtenerEmailAsociadoCelular(limpio);
+    if (emailAsociado) {
+      return emailAsociado;
+    }
+
+    return obtenerCredencialFirebase(limpio);
+  };
+
   const ejecutarLogin = async () => {
     const credencialInput = formLogin.emailOrTel.trim();
-    const emailFinal = obtenerCredencialFirebase(credencialInput);
+    if (!credencialInput || !formLogin.pass) {
+      alert('Ingresa tu correo o celular y la contraseña.');
+      return;
+    }
+
+    const emailFinal = await resolverCredencialLogin(credencialInput);
     const esAdminMail = emailFinal.toLowerCase() === 'proquimicajcv@icloud.com';
+    const telefonoLogin = credencialInput.includes('@') ? '' : normalizarTelefono(credencialInput);
 
     try {
       await setPersistence(auth, browserLocalPersistence);
       const cred = await signInWithEmailAndPassword(auth, emailFinal, formLogin.pass);
+      const userDocRef = doc(db, 'usuarios', cred.user.uid);
+      const userSnap = await getDoc(userDocRef);
+      const datosUsuario = userSnap.exists() ? userSnap.data() : {};
+
+      if (datosUsuario?.baneado) {
+        await signOut(auth);
+        alert(construirMensajeBaneo(datosUsuario.motivoBaneo || 'Violación de las reglas de la comunidad'));
+        return;
+      }
+
       try {
         localStorage.removeItem(CLAVE_LOGOUT_MANUAL);
       } catch (e) {}
@@ -2105,14 +2461,14 @@ export default function App() {
         nombre: esAdminMail ? 'Jorge Carvajal' : (cred.user.displayName || credencialInput),
         rol: esAdminMail ? 'Administrador General' : 'Usuario Regular'
       });
-      const userDocRef = doc(db, 'usuarios', cred.user.uid);
       await setDoc(userDocRef, crearDatosUsuarioFirestore({
         uid: cred.user.uid,
         email: cred.user.email,
         nombre: esAdminMail ? 'Jorge Carvajal' : (cred.user.displayName || credencialInput),
         rol: esAdminMail ? 'Administrador General' : 'Usuario Regular',
         ultimoAcceso: new Date().toLocaleString('es-CR', { timeZone: 'America/Costa_Rica' }),
-        ultimoConexion: Date.now()
+        ultimoConexion: Date.now(),
+        telefono: telefonoLogin || undefined
       }), { merge: true });
       limpiarBorradorLogin();
       setModalPerfil(false);
@@ -2138,7 +2494,42 @@ export default function App() {
 
   const ejecutarRegistro = async () => {
     const credencialInput = formReg.emailOrTel.trim();
-    const emailFinal = obtenerCredencialFirebase(credencialInput);
+    const correoRecuperacion = formReg.correoRecuperacion.trim().toLowerCase();
+
+    if (!formReg.pass || !formReg.nombre.trim()) {
+      alert('Completa nombre y contraseña para continuar.');
+      return;
+    }
+
+    const validacion = validarRegistroContacto({ credencialInput, correoRecuperacion });
+    if (!validacion.ok) {
+      alert(validacion.error);
+      return;
+    }
+
+    const telefonoRegistro = validacion.esCorreo ? '' : validacion.telefono;
+    const emailFinal = validacion.emailFinal;
+
+    if (!validacion.esCorreo) {
+      const existeTelefono = await getDocs(
+        query(collection(db, 'usuarios'), where('telefono', '==', telefonoRegistro), limit(1))
+      );
+
+      if (!existeTelefono.empty) {
+        alert('Ese número de celular ya está registrado.');
+        return;
+      }
+    }
+
+    const queryBaneo = await getDocs(
+      query(collection(db, 'usuarios'), where('email', '==', emailFinal), limit(1))
+    );
+    const usuarioBaneado = queryBaneo.docs.some((docSnap) => docSnap.data()?.baneado);
+    if (usuarioBaneado) {
+      alert(construirMensajeBaneo(queryBaneo.docs[0].data()?.motivoBaneo || 'Violación de las reglas de la comunidad'));
+      return;
+    }
+
     const esAdminMail = emailFinal.toLowerCase() === 'proquimicajcv@icloud.com';
 
     try {
@@ -2162,7 +2553,8 @@ export default function App() {
         nombre: nombreFinal,
         rol: esAdminMail ? 'Administrador General' : 'Usuario Regular',
         ultimoAcceso: new Date().toLocaleString('es-CR', { timeZone: 'America/Costa_Rica' }),
-        ultimoConexion: Date.now()
+        ultimoConexion: Date.now(),
+        telefono: telefonoRegistro || undefined
       }), { merge: true });
       limpiarBorradorLogin();
       alert('¡Cuenta creada correctamente!');
@@ -2183,6 +2575,122 @@ export default function App() {
       } else {
         alert('Error al registrar. Es posible que el correo o teléfono ya esté registrado.');
       }
+    }
+  };
+
+  const ejecutarRecuperacionContrasena = async () => {
+    const contacto = (formRecuperacion.emailOrTel || formLogin.emailOrTel).trim();
+    if (!contacto) {
+      alert('Ingresa tu correo o celular para recuperar la contraseña.');
+      return;
+    }
+
+    const contactoNormalizado = normalizarContactoRecuperacion(contacto);
+    if (!contactoNormalizado) {
+      alert('Ingresa un correo o celular válido.');
+      return;
+    }
+
+    const codigo = generarCodigoRecuperacion();
+    const emailDestino = contactoNormalizado.includes('@') ? contactoNormalizado : '';
+    setCodigoTemporal(codigo);
+    setCodigoRecuperacionEnviado(true);
+    setCodigoRecuperacion('');
+    setEmailRecuperacion(emailDestino);
+
+    try {
+      const res = await fetch('/api/enviar-codigo-recuperacion', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contacto: contactoNormalizado, codigo })
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        throw new Error(data?.error || 'No fue posible iniciar la recuperación.');
+      }
+
+      setEmailRecuperacion(data?.email || emailDestino);
+      const mensaje = contactoNormalizado.includes('@')
+        ? `Te enviamos el código de recuperación y el enlace para restablecer tu contraseña al correo ${data.email}.`
+        : `Te enviamos el código de recuperación al celular asociado a tu cuenta (${data.email}).`;
+
+      if (data?.email) {
+        try {
+          const emailRes = await fetch('/api/enviar-email-recuperacion', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ contacto: data.email, codigo, resetLink: data.resetLink || '' })
+          });
+          const emailData = await emailRes.json().catch(() => ({}));
+          if (!emailRes.ok && emailData?.error) {
+            console.warn('Correo de recuperación no enviado:', emailData.error);
+          }
+        } catch (emailError) {
+          console.warn('Correo de recuperación no enviado:', emailError);
+        }
+      }
+
+      alert(`${mensaje}\nCódigo: ${codigo}`);
+    } catch (e) {
+      setCodigoRecuperacionEnviado(false);
+      setCodigoTemporal('');
+      alert('No se pudo enviar la recuperación en este momento. Intenta nuevamente en unos minutos.');
+    }
+  };
+
+  const confirmarCodigoRecuperacion = () => {
+    if (!codigoRecuperacion.trim()) {
+      alert('Ingresa el código de recuperación que recibiste.');
+      return;
+    }
+
+    if (codigoRecuperacion.trim() !== codigoTemporal) {
+      alert('El código ingresado no coincide. Intenta de nuevo.');
+      return;
+    }
+
+    setCodigoVerificado(true);
+    setCodigoRecuperacion('');
+    setCodigoRecuperacionEnviado(false);
+    alert('Código verificado. Ahora define una nueva contraseña.');
+  };
+
+  const restablecerContrasena = async () => {
+    if (!codigoVerificado) {
+      alert('Primero confirma el código de recuperación.');
+      return;
+    }
+
+    if (!nuevaContrasena || nuevaContrasena.length < 6) {
+      alert('La nueva contraseña debe tener al menos 6 caracteres.');
+      return;
+    }
+
+    try {
+      const contactoDestino = emailRecuperacion || formRecuperacion.emailOrTel || formLogin.emailOrTel;
+      const res = await fetch('/api/recuperar-cuenta', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contacto: contactoDestino, nuevaContrasena })
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        throw new Error(data?.error || 'No fue posible restablecer la contraseña.');
+      }
+
+      setFormRecuperacion({ emailOrTel: '' });
+      setCodigoRecuperacion('');
+      setCodigoRecuperacionEnviado(false);
+      setCodigoTemporal('');
+      setNuevaContrasena('');
+      setCodigoVerificado(false);
+      setEmailRecuperacion('');
+      setVistaPerfil('login');
+      alert('¡Contraseña restablecida correctamente! Ya puedes iniciar sesión con la nueva contraseña.');
+    } catch (e) {
+      alert('No se pudo cambiar la contraseña en este momento. Intenta nuevamente.');
     }
   };
 
@@ -3478,6 +3986,7 @@ export default function App() {
                                 )}
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
                                   <button onClick={() => cambiarNombreUsuarioAdmin(u.id, u.nombre)} style={{ backgroundColor: '#0288D1', color: '#FFF', border: 'none', padding: '0.45rem 0.8rem', borderRadius: '6px', fontWeight: 'bold', cursor: 'pointer', fontSize: '0.75rem' }}>✏️ Cambiar Nombre</button>
+                                  <button onClick={() => actualizarEstadoBaneoUsuario(u.id, u, !Boolean(u.baneado))} style={{ backgroundColor: u.baneado ? '#2E7D32' : '#B71C1C', color: '#FFF', border: 'none', padding: '0.45rem 0.8rem', borderRadius: '6px', fontWeight: 'bold', cursor: 'pointer', fontSize: '0.75rem' }}>{u.baneado ? '✅ Desbanear' : '🚫 Banear'}</button>
                                   {esAdminGeneral && !esUsuarioPrincipal(u.email, u.nombre, u.id, 'admin_jcv_master') ? (
                                     <div style={{ backgroundColor: '#2A2408', color: '#FFD700', border: '1px solid #FFD700', padding: '0.45rem 0.9rem', borderRadius: '8px', fontSize: '0.8rem', fontWeight: 'bold' }}>👑 Admin General</div>
                                   ) : (
@@ -3534,6 +4043,7 @@ export default function App() {
                                 )}
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
                                   <button onClick={() => cambiarNombreUsuarioAdmin(u.id, u.nombre)} style={{ backgroundColor: '#0288D1', color: '#FFF', border: 'none', padding: '0.45rem 0.8rem', borderRadius: '6px', fontWeight: 'bold', cursor: 'pointer', fontSize: '0.75rem' }}>✏️ Cambiar Nombre</button>
+                                  <button onClick={() => actualizarEstadoBaneoUsuario(u.id, u, !Boolean(u.baneado))} style={{ backgroundColor: u.baneado ? '#2E7D32' : '#B71C1C', color: '#FFF', border: 'none', padding: '0.45rem 0.8rem', borderRadius: '6px', fontWeight: 'bold', cursor: 'pointer', fontSize: '0.75rem' }}>{u.baneado ? '✅ Desbanear' : '🚫 Banear'}</button>
                                   <select defaultValue={u.rol || 'Experto Herpetólogo'} onChange={(e) => u.nuevoRolTemp = e.target.value} style={{ padding: '0.45rem', backgroundColor: '#09130F', color: '#0288D1', border: '1px solid #0288D1', borderRadius: '6px', fontSize: '0.8rem', fontWeight: 'bold' }}>
                                     <option value="Usuario Regular">👤 Usuario Regular</option>
                                     <option value="Experto Herpetólogo">🔬 Experto Herpetólogo</option>
@@ -3565,6 +4075,9 @@ export default function App() {
                                 <div>
                                   <strong style={{ color: '#FFF', fontSize: '0.95rem', display: 'inline-flex', alignItems: 'center', gap: '0.35rem', flexWrap: 'wrap' }}>
                                     <span>{u.nombre || 'Usuario'}</span>
+                                    {u.baneado && (
+                                      <span style={{ fontSize: '0.66rem', backgroundColor: '#4A0F17', color: '#FFB3B3', padding: '2px 7px', borderRadius: '999px', fontWeight: '800' }}>🚫 Baneado</span>
+                                    )}
                                     {renderizarInsigniaUsuario(statsUsuario.validados)}
                                   </strong>
                                   <span style={{ display: 'block', fontSize: '0.75rem', color: '#7AA394' }}>✉️ {(u.email || '').includes('@herpid.cr') ? `Celular: ${(u.email || '').replace('tel_', '').replace('@herpid.cr', '')}` : (u.email || 'Sin correo')}</span>
@@ -3575,6 +4088,7 @@ export default function App() {
                                 </div>
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
                                   <button onClick={() => cambiarNombreUsuarioAdmin(u.id, u.nombre)} style={{ backgroundColor: '#0288D1', color: '#FFF', border: 'none', padding: '0.45rem 0.8rem', borderRadius: '6px', fontWeight: 'bold', cursor: 'pointer', fontSize: '0.75rem' }}>✏️ Cambiar Nombre</button>
+                                  <button onClick={() => actualizarEstadoBaneoUsuario(u.id, u, !Boolean(u.baneado))} style={{ backgroundColor: u.baneado ? '#2E7D32' : '#B71C1C', color: '#FFF', border: 'none', padding: '0.45rem 0.8rem', borderRadius: '6px', fontWeight: 'bold', cursor: 'pointer', fontSize: '0.75rem' }}>{u.baneado ? '✅ Desbanear' : '🚫 Banear'}</button>
                                   <select defaultValue={u.rol || 'Usuario Regular'} onChange={(e) => u.nuevoRolTemp = e.target.value} style={{ padding: '0.45rem', backgroundColor: '#09130F', color: '#CD7F32', border: '1px solid #CD7F32', borderRadius: '6px', fontSize: '0.8rem', fontWeight: 'bold' }}>
                                     <option value="Usuario Regular">👤 Usuario Regular</option>
                                     <option value="Experto Herpetólogo">🔬 Experto Herpetólogo</option>
@@ -3826,29 +4340,6 @@ export default function App() {
               </div>
             </div>
 
-            <div style={{ marginBottom: '0.8rem' }}>
-              <label style={{ color: '#8AA398', fontSize: '0.75rem', fontWeight: 'bold' }}>Cantón y Ubicación (Autodetecta coordenadas)</label>
-              <input 
-                type="text" 
-                value={registroEditando.ubicacion || ''} 
-                onChange={(e) => {
-                  const val = e.target.value;
-                  const cantonMatch = buscarCantonEnTexto(val);
-                  setRegistroEditando({ 
-                    ...registroEditando, 
-                    ubicacion: val,
-                    ...(cantonMatch ? {
-                      latEdit: cantonMatch.coords[0],
-                      lngEdit: cantonMatch.coords[1],
-                      altitud: `${cantonMatch.alt} msnm`,
-                      temp: `${cantonMatch.temp} °C`
-                    } : {})
-                  });
-                }} 
-                style={{ width: '100%', padding: '0.6rem', backgroundColor: '#050A08', color: '#FFF', border: '1px solid #00FF88', borderRadius: '8px', boxSizing: 'border-box' }} 
-              />
-            </div>
-
             <div style={{ backgroundColor: '#050A08', padding: '0.8rem', borderRadius: '10px', border: '1px solid #00FF88', marginBottom: '0.8rem' }}>
               <label style={{ color: '#00FF88', fontSize: '0.8rem', fontWeight: 'bold', display: 'block', marginBottom: '0.4rem' }}>
                 📍 Corrección Manual de Coordenadas GPS
@@ -4001,7 +4492,7 @@ export default function App() {
         <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.85)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 9999, padding: '1rem' }}>
           <div style={{ backgroundColor: '#09130F', borderRadius: '16px', border: '1px solid #1B3D2F', width: '100%', maxWidth: '420px', padding: '1.5rem', maxHeight: '92vh', overflowY: 'auto' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '1.2rem' }}>
-              <h3 style={{ color: '#FFF', margin: 0 }}>{usuario.isLoggedIn ? '👤 Mi Perfil' : (vistaPerfil === 'login' ? '🔑 Iniciar Sesión' : '📝 Crear Cuenta')}</h3>
+              <h3 style={{ color: '#FFF', margin: 0 }}>{usuario.isLoggedIn ? '👤 Mi Perfil' : (vistaPerfil === 'login' ? '🔑 Iniciar Sesión' : (vistaPerfil === 'registro' ? '📝 Crear Cuenta' : '🔁 Recuperar Contraseña'))}</h3>
               <button onClick={() => setModalPerfil(false)} style={{ background: 'transparent', border: 'none', color: '#FFF', fontSize: '1.4rem', cursor: 'pointer' }}>✕</button>
             </div>
 
@@ -4115,12 +4606,28 @@ export default function App() {
                   </button>
                 </div>
                 <button onClick={ejecutarLogin} style={{ width: '100%', padding: '0.85rem', backgroundColor: '#00E676', color: '#000', border: 'none', borderRadius: '10px', fontWeight: 'bold', cursor: 'pointer', fontSize: '1rem' }}>Ingresar</button>
+                <button onClick={() => { setFormRecuperacion({ emailOrTel: formLogin.emailOrTel || '' }); setVistaPerfil('recuperar'); }} style={{ width: '100%', background: 'transparent', color: '#8AA398', border: 'none', marginTop: '0.65rem', cursor: 'pointer', textDecoration: 'underline' }}>¿Olvidaste tu contraseña?</button>
+                <button onClick={() => { setFormRecuperacion({ emailOrTel: formLogin.emailOrTel || '' }); setVistaPerfil('recuperar'); }} style={{ width: '100%', background: 'transparent', color: '#00FF88', border: 'none', marginTop: '0.15rem', cursor: 'pointer', textDecoration: 'underline', fontWeight: 'bold' }}>Recuperar cuenta con correo</button>
                 <button onClick={() => setVistaPerfil('registro')} style={{ width: '100%', background: 'transparent', color: '#00FF88', border: 'none', marginTop: '1rem', cursor: 'pointer', textDecoration: 'underline' }}>¿No tienes cuenta? Regístrate aquí</button>
               </div>
-            ) : (
+            ) : vistaPerfil === 'registro' ? (
               <div>
                 <input type="text" placeholder="Tu nombre completo" value={formReg.nombre} onChange={(e) => setFormReg({ ...formReg, nombre: e.target.value })} style={{ width: '100%', padding: '0.75rem', backgroundColor: '#050A08', color: '#FFF', border: '1px solid #1B3D2F', borderRadius: '8px', marginBottom: '0.9rem', boxSizing: 'border-box' }} /> 
                 <input type="text" placeholder="Correo electrónico o Celular (+506...)" value={formReg.emailOrTel} onChange={(e) => setFormReg({ ...formReg, emailOrTel: e.target.value })} style={{ width: '100%', padding: '0.75rem', backgroundColor: '#050A08', color: '#FFF', border: '1px solid #1B3D2F', borderRadius: '8px', marginBottom: '0.9rem', boxSizing: 'border-box' }} /> 
+                {!formReg.emailOrTel.includes('@') && formReg.emailOrTel.trim().length > 0 && (
+                  <>
+                    <input
+                      type="email"
+                      placeholder="Correo para recuperación"
+                      value={formReg.correoRecuperacion}
+                      onChange={(e) => setFormReg({ ...formReg, correoRecuperacion: e.target.value })}
+                      style={{ width: '100%', padding: '0.75rem', backgroundColor: '#050A08', color: '#FFF', border: '1px solid #1B3D2F', borderRadius: '8px', marginBottom: '0.45rem', boxSizing: 'border-box' }}
+                    />
+                    <p style={{ margin: '0 0 0.9rem 0', fontSize: '0.72rem', color: '#8AA398', lineHeight: 1.4 }}>
+                      Si te registras con celular, este correo será obligatorio para recibir el código o enlace de recuperación si olvidas tu contraseña.
+                    </p>
+                  </>
+                )}
                 <div style={{ position: 'relative', marginBottom: '0.9rem' }}>
                   <input
                     type={mostrarPassRegistro ? 'text' : 'password'}
@@ -4140,6 +4647,46 @@ export default function App() {
                 </div>
                 <button onClick={ejecutarRegistro} style={{ width: '100%', padding: '0.85rem', backgroundColor: '#00E676', color: '#000', border: 'none', borderRadius: '10px', fontWeight: 'bold', cursor: 'pointer', fontSize: '1rem' }}>Crear Cuenta</button>
                 <button onClick={() => setVistaPerfil('login')} style={{ width: '100%', background: 'transparent', color: '#8AA398', border: 'none', marginTop: '0.8rem', cursor: 'pointer' }}>← Volver a Iniciar Sesión</button>
+              </div>
+            ) : (
+              <div>
+                <h4 style={{ color: '#00FF88', margin: '0 0 0.6rem 0', fontSize: '0.95rem' }}>Recuperar cuenta por correo o celular</h4>
+                <input
+                  type="text"
+                  placeholder="Escribe tu correo o celular registrado"
+                  value={formRecuperacion.emailOrTel}
+                  onChange={(e) => setFormRecuperacion({ emailOrTel: e.target.value })}
+                  style={{ width: '100%', padding: '0.75rem', backgroundColor: '#050A08', color: '#FFF', border: '1px solid #1B3D2F', borderRadius: '8px', marginBottom: '0.7rem', boxSizing: 'border-box' }}
+                />
+                <p style={{ margin: '0 0 0.85rem 0', fontSize: '0.75rem', color: '#8AA398', lineHeight: 1.4 }}>
+                  Si escribes correo, te enviaremos el enlace y un código de recuperación. Si escribes celular, el enlace llegará al correo vinculado a ese número.
+                </p>
+                {!codigoRecuperacionEnviado && !codigoVerificado ? (
+                  <button onClick={ejecutarRecuperacionContrasena} style={{ width: '100%', padding: '0.85rem', backgroundColor: '#00E676', color: '#000', border: 'none', borderRadius: '10px', fontWeight: 'bold', cursor: 'pointer', fontSize: '1rem' }}>Enviar recuperación</button>
+                ) : !codigoVerificado ? (
+                  <>
+                    <input
+                      type="text"
+                      placeholder="Ingresa el código de 6 dígitos"
+                      value={codigoRecuperacion}
+                      onChange={(e) => setCodigoRecuperacion(e.target.value)}
+                      style={{ width: '100%', padding: '0.75rem', backgroundColor: '#050A08', color: '#FFF', border: '1px solid #1B3D2F', borderRadius: '8px', marginBottom: '0.7rem', boxSizing: 'border-box' }}
+                    />
+                    <button onClick={confirmarCodigoRecuperacion} style={{ width: '100%', padding: '0.85rem', backgroundColor: '#00E676', color: '#000', border: 'none', borderRadius: '10px', fontWeight: 'bold', cursor: 'pointer', fontSize: '1rem' }}>Confirmar código</button>
+                  </>
+                ) : (
+                  <>
+                    <input
+                      type="password"
+                      placeholder="Nueva contraseña"
+                      value={nuevaContrasena}
+                      onChange={(e) => setNuevaContrasena(e.target.value)}
+                      style={{ width: '100%', padding: '0.75rem', backgroundColor: '#050A08', color: '#FFF', border: '1px solid #1B3D2F', borderRadius: '8px', marginBottom: '0.7rem', boxSizing: 'border-box' }}
+                    />
+                    <button onClick={restablecerContrasena} style={{ width: '100%', padding: '0.85rem', backgroundColor: '#00E676', color: '#000', border: 'none', borderRadius: '10px', fontWeight: 'bold', cursor: 'pointer', fontSize: '1rem' }}>Restablecer contraseña</button>
+                  </>
+                )}
+                <button onClick={() => { setVistaPerfil('login'); setCodigoRecuperacionEnviado(false); setCodigoTemporal(''); setCodigoRecuperacion(''); setNuevaContrasena(''); setCodigoVerificado(false); setEmailRecuperacion(''); }} style={{ width: '100%', background: 'transparent', color: '#8AA398', border: 'none', marginTop: '0.8rem', cursor: 'pointer' }}>← Volver a Iniciar Sesión</button>
               </div>
             )}
           </div>
@@ -4216,29 +4763,6 @@ export default function App() {
               </label>
             </div>
 
-            <div style={{ marginBottom: '0.8rem' }}>
-              <label style={{ color: '#8AA398', fontSize: '0.75rem', fontWeight: 'bold' }}> Cantón y Ubicación exactos (Autodetecta mapa)</label>
-              <input 
-                type="text" 
-                placeholder="Ej. Zarcero, Tarrazú, Dota..." 
-                value={comunidad} 
-                onChange={(e) => { 
-                  const val = e.target.value;
-                  setComunidad(val); 
-                  setErrorEnvio(''); 
-                  const cantonMatch = buscarCantonEnTexto(val);
-                  if (cantonMatch) {
-                    setLat(cantonMatch.coords[0].toFixed(6));
-                    setLng(cantonMatch.coords[1].toFixed(6));
-                    setPosPin(cantonMatch.coords);
-                    setAltitud(cantonMatch.alt);
-                    setTemp(cantonMatch.temp);
-                  }
-                }} 
-                style={{ width: '100%', padding: '0.65rem', backgroundColor: '#050A08', color: '#FFF', border: comunidad ? '1px solid #00FF88' : '1px solid #FF5252', borderRadius: '8px', marginTop: '0.2rem', boxSizing: 'border-box' }} 
-              />
-            </div>
-
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.8rem', marginBottom: '0.8rem' }}>
               <div>
                 <label style={{ color: '#8AA398', fontSize: '0.75rem' }}>Microhábitat</label>
@@ -4268,16 +4792,12 @@ export default function App() {
             </div>
 
             <div style={{ marginBottom: '0.6rem' }}>
-              <button onClick={obtenerUbicacionGPS} type="button" style={{ width: '100%', padding: '0.5rem', backgroundColor: '#102E23', color: '#00FF88', border: '1px solid #00FF88', borderRadius: '8px', fontWeight: 'bold', cursor: 'pointer', fontSize: '0.8rem', marginBottom: '0.5rem' }}>
-                📍 Obtener mi ubicación actual (GPS)
-              </button>
-
               <div style={{ height: '170px', borderRadius: '12px', overflow: 'hidden', border: '1px solid #1B3D2F' }}>
                 <MapContainer center={posPin} zoom={11} style={{ height: '100%', width: '100%' }}>
                   <TileLayer url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}" />
                   <TileLayer url="https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}" />
-                  <Marker position={posPin} icon={iconoAlfilerRojo} />
-                  <EventoMapaPin setLat={setLat} setLng={setLng} setPosPin={setPosPin} setTemp={setTemp} setAltitud={setAltitud} />
+                  <MarcadorMapaInteractivo posPin={posPin} setLat={setLat} setLng={setLng} setPosPin={setPosPin} setTemp={setTemp} setAltitud={setAltitud} setComunidad={setComunidad} setErrorEnvio={setErrorEnvio} />
+                  <EventoMapaPin setLat={setLat} setLng={setLng} setPosPin={setPosPin} setTemp={setTemp} setAltitud={setAltitud} setComunidad={setComunidad} setErrorEnvio={setErrorEnvio} />
                 </MapContainer>
               </div>
             </div>
@@ -4366,6 +4886,22 @@ export default function App() {
                   {fotosRegistro.map((f, i) => (
                     <div key={i} style={{ border: i === fotoPrincipalIndex ? '2px solid #00FF88' : '1px solid #1B3D2F', borderRadius: '8px', padding: '0.3rem', backgroundColor: '#09130F' }}>
                       <img src={f} alt={`preview_${i}`} onClick={() => setLightboxData({ fotos: fotosRegistro, index: i })} style={{ width: '60px', height: '50px', objectFit: 'contain', backgroundColor: '#000', borderRadius: '6px', border: '1px solid #00FF88', cursor: 'pointer', display: 'block' }} title="Click para ampliar imagen" />
+                      <div style={{ display: 'flex', gap: '0.25rem', marginTop: '0.3rem' }}>
+                        <button
+                          type="button"
+                          onClick={() => moverFotoRegistro(i, -1)}
+                          style={{ flex: 1, backgroundColor: '#123529', color: '#BEE8D0', border: 'none', borderRadius: '6px', padding: '0.2rem 0.3rem', fontSize: '0.66rem', fontWeight: 'bold', cursor: 'pointer' }}
+                        >
+                          ↑
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => moverFotoRegistro(i, 1)}
+                          style={{ flex: 1, backgroundColor: '#123529', color: '#BEE8D0', border: 'none', borderRadius: '6px', padding: '0.2rem 0.3rem', fontSize: '0.66rem', fontWeight: 'bold', cursor: 'pointer' }}
+                        >
+                          ↓
+                        </button>
+                      </div>
                       <button
                         type="button"
                         onClick={() => setFotoPrincipalIndex(i)}
@@ -4411,105 +4947,7 @@ export default function App() {
               </span>
             </label>
 
-            <button onClick={async () => {
-              if (!comunidad.trim()) {
-                setErrorEnvio('⚠️ Debe indicar la ubicación o cantón obligatoriamente.');
-                return;
-              }
-
-              if (fotosRegistro.filter(Boolean).length === 0) {
-                setErrorEnvio('⚠️ Debes adjuntar al menos una fotografía para enviar el reporte.');
-                return;
-              }
-
-              const fechaEventoMs = usarFechaActualAvistamiento
-                ? Date.now()
-                : (parsearFechaInputLocal(fechaHoraAvistamiento) || Date.now());
-              const fechaEventoTexto = new Date(fechaEventoMs).toLocaleString('es-CR', { timeZone: 'America/Costa_Rica' });
-              
-              const nombreReportante = usuario.isLoggedIn 
-                ? (usuario.nombre || usuario.email) 
-                : 'Usuario Anónimo';
-              const provinciaDetectada = buscarProvinciaEnTexto(comunidad) || buscarProvinciaEnTexto(`${comunidad} ${nombreComun} ${nombreCientifico}`) || 'San José';
-
-              const fotosBase = fotosRegistro.slice(0, 3).filter(Boolean);
-              const fotosNormalizadas = [];
-              for (let i = 0; i < fotosBase.length; i += 1) {
-                const foto = fotosBase[i];
-                if (typeof foto === 'string' && foto.startsWith('data:image/')) {
-                  const ruta = `avistamientos/${usuario.id || 'anonimo'}/${Date.now()}-${i}.jpg`;
-                  const referencia = ref(storage, ruta);
-                  await uploadString(referencia, foto, 'data_url');
-                  fotosNormalizadas.push(await getDownloadURL(referencia));
-                } else {
-                  fotosNormalizadas.push(foto);
-                }
-              }
-
-              const fotoInicial = fotosNormalizadas[fotoPrincipalIndex] || fotosNormalizadas[0] || '';
-              const fotosOrdenadas = [
-                fotoInicial,
-                ...fotosNormalizadas.filter((f) => f && f !== fotoInicial)
-              ].filter(Boolean).slice(0, 3);
-
-              if (fotosOrdenadas.length === 0 || !fotoInicial) {
-                setErrorEnvio('⚠️ No se pudo confirmar una foto válida para el reporte. Vuelve a cargar la imagen e inténtalo de nuevo.');
-                return;
-              }
-
-              const nuevo = {
-                userId: usuario.id || null,
-                userEmail: usuario.email || null,
-                nombreComun: desconocido ? 'Desconocido (Por verificar)' : (nombreComun || 'Avistamiento'),
-                especie: desconocido ? 'Especie por verificar' : (nombreCientifico || nombreComun),
-                categoria: tipoFauna.toUpperCase(),
-                silueta: silueta,
-                esPeligroso: esPeligrosoReporte,
-                estado: 'EN REVISIÓN EXPERTA',
-                ubicacion: comunidad,
-                provincia: provinciaDetectada,
-                reportante: nombreReportante,
-                autorizaNombrePublico,
-                temp: `${temp} °C`,
-                altitud: `${altitud} msnm`,
-                microhabitat: microhabitat,
-                estadoVida: `${estadoOrganismo} (${etapa})`,
-                horaRegistro: fechaEventoTexto,
-                fechaAvistamiento: fechaEventoTexto,
-                fechaAvistamientoMs: fechaEventoMs,
-                fechaAvistamientoManual: !usarFechaActualAvistamiento,
-                audioURL: audioURL || null,
-                fotos: fotosOrdenadas,
-                fotoAutorizada: fotoInicial || null,
-                img: fotoInicial || null,
-                fotoPrincipalIndex,
-                coords: [parseFloat(lat) || 9.65, parseFloat(lng) || -84.00],
-                createdAt: Date.now()
-              };
-
-              try {
-                await addDoc(collection(db, 'avistamientos'), nuevo);
-                limpiarBorradorReporte();
-                alert(`¡Avistamiento enviado a revisión experta por parte de ${nombreReportante}!`);
-                setModalRegistro(false);
-              } catch (e) {
-                const codigoError = String(e?.code || '').toLowerCase();
-                let mensajeError = 'Error al enviar el reporte a la nube.';
-
-                if (codigoError.includes('permission-denied')) {
-                  mensajeError = 'No tienes permiso para guardar este reporte. Verifica tu sesión e inténtalo de nuevo.';
-                } else if (codigoError.includes('unavailable') || codigoError.includes('network') || codigoError.includes('deadline-exceeded')) {
-                  mensajeError = 'No se pudo conectar con la nube. Revisa tu internet e inténtalo de nuevo.';
-                } else if (codigoError.includes('invalid-argument') || codigoError.includes('resource-exhausted')) {
-                  mensajeError = 'El reporte es demasiado pesado. Reduce el tamaño de las fotos o usa menos adjuntos.';
-                } else if (codigoError.includes('quota-exceeded')) {
-                  mensajeError = 'Se alcanzó el límite de almacenamiento o escritura. Intenta más tarde.';
-                }
-
-                setErrorEnvio(mensajeError);
-                alert(mensajeError);
-              }
-            }} disabled={fotosRegistro.filter(Boolean).length === 0} type="button" style={{ width: '100%', padding: '0.85rem', backgroundColor: fotosRegistro.filter(Boolean).length > 0 ? '#00E676' : '#6A8A7D', color: fotosRegistro.filter(Boolean).length > 0 ? '#000' : '#E0E0E0', fontWeight: 'bold', border: 'none', borderRadius: '10px', cursor: fotosRegistro.filter(Boolean).length > 0 ? 'pointer' : 'not-allowed', fontSize: '1rem', opacity: fotosRegistro.filter(Boolean).length > 0 ? 1 : 0.85 }}>Enviar Reporte Científico</button>
+            <button onClick={enviarReporteCientifico} disabled={enviandoReporte} type="button" style={{ width: '100%', padding: '0.85rem', backgroundColor: enviandoReporte ? '#6A8A7D' : '#00E676', color: enviandoReporte ? '#E0E0E0' : '#000', fontWeight: 'bold', border: 'none', borderRadius: '10px', cursor: enviandoReporte ? 'not-allowed' : 'pointer', fontSize: '1rem', opacity: enviandoReporte ? 0.85 : 1 }}>{enviandoReporte ? 'Enviando reporte...' : 'Enviar Reporte Científico'}</button>
 
             <button onClick={() => setModalRegistro(false)} type="button" style={{ width: '100%', padding: '0.6rem', backgroundColor: 'transparent', color: '#8AA398', border: 'none', marginTop: '0.5rem', cursor: 'pointer' }}>Cancelar</button>
           </div>

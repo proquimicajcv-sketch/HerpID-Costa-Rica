@@ -28,7 +28,11 @@ const borradorReportePorDefecto = () => ({
 
 function leerStorage(key) {
   try {
-    return window.localStorage.getItem(key);
+    const storage = obtenerStorage();
+    if (!storage) return null;
+    const leer = storage.getItem || storage.getltem;
+    if (typeof leer !== 'function') return null;
+    return leer.call(storage, key);
   } catch {
     return null;
   }
@@ -36,14 +40,34 @@ function leerStorage(key) {
 
 function guardarStorage(key, valor) {
   try {
-    window.localStorage.setItem(key, JSON.stringify(valor));
+    const storage = obtenerStorage();
+    if (!storage) return;
+    const guardar = storage.setItem || storage.setltem;
+    if (typeof guardar !== 'function') return;
+    guardar.call(storage, key, JSON.stringify(valor));
   } catch {}
 }
 
 function limpiarStorage(key) {
   try {
-    window.localStorage.removeItem(key);
+    const storage = obtenerStorage();
+    if (!storage) return;
+    const limpiar = storage.removeItem || storage.removeltem;
+    if (typeof limpiar !== 'function') return;
+    limpiar.call(storage, key);
   } catch {}
+}
+
+function obtenerStorage() {
+  if (typeof globalThis !== 'undefined' && globalThis.localStorage) {
+    return globalThis.localStorage;
+  }
+
+  if (typeof window !== 'undefined' && window.localStorage) {
+    return window.localStorage;
+  }
+
+  return null;
 }
 
 const faqImagenesPorDefecto = () => ({

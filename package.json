@@ -9,14 +9,17 @@
     "dev:resiliente": "sh -c 'while true; do vite --host 0.0.0.0 --port 3000; code=$?; if [ $code -eq 0 ] || [ $code -eq 130 ]; then exit $code; fi; echo [dev] Vite se detuvo con codigo $code. Reiniciando en 2s...; sleep 2; done'",
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0 --port 3000",
-    "test": "node --test tests/*.test.js"
+    "test": "node --test tests/*.test.js",
+    "check:sms-config": "node scripts/check-sms-config.mjs"
   },
   "dependencies": {
     "firebase": "^10.8.0",
+    "firebase-admin": "^14.2.0",
     "leaflet": "^1.9.4",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "react-leaflet": "^4.2.1"
+    "react-leaflet": "^4.2.1",
+    "twilio": "^6.0.2"
   },
   "devDependencies": {
     "@playwright/test": "^1.62.1",
