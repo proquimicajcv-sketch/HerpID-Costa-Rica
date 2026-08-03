@@ -2187,6 +2187,9 @@ export default function App() {
           if (typeof resultadoSubida.url === 'string' && resultadoSubida.url.startsWith('http')) {
             fotosNormalizadas.push(resultadoSubida.url);
           } else {
+            if (typeof resultadoSubida.url === 'string' && resultadoSubida.url.startsWith('data:image/')) {
+              fotosNormalizadas.push(resultadoSubida.url);
+            }
             fotosSinSubir += 1;
           }
         } else {
@@ -2242,6 +2245,11 @@ export default function App() {
       const resultado = await persistirAvistamientoConFallback({
         payload: nuevo,
         guardarRemoto: async (payload) => {
+          const requiereSubidaServidor = Array.isArray(payload?.fotos) && payload.fotos.some((f) => String(f || '').startsWith('data:image/'));
+          if (requiereSubidaServidor) {
+            throw new Error('subida-servidor-requerida');
+          }
+
           const docRef = await addDoc(collection(db, 'avistamientos'), payload);
           return { ok: true, id: docRef?.id || null };
         },

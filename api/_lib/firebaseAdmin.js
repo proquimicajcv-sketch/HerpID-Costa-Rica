@@ -1,6 +1,7 @@
 import { cert, getApps, initializeApp } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
+import { getStorage } from 'firebase-admin/storage';
 
 function requiredEnv(name) {
   const value = process.env[name];
@@ -17,17 +18,22 @@ function getPrivateKey() {
 
 export function getFirebaseAdmin() {
   if (!getApps().length) {
+    const projectId = requiredEnv('FIREBASE_PROJECT_ID');
+    const storageBucket = process.env.FIREBASE_STORAGE_BUCKET || `${projectId}.appspot.com`;
+
     initializeApp({
       credential: cert({
-        projectId: requiredEnv('FIREBASE_PROJECT_ID'),
+        projectId,
         clientEmail: requiredEnv('FIREBASE_CLIENT_EMAIL'),
         privateKey: getPrivateKey()
-      })
+      }),
+      storageBucket
     });
   }
 
   return {
     adminAuth: getAuth(),
-    adminDb: getFirestore()
+    adminDb: getFirestore(),
+    adminStorage: getStorage()
   };
 }
