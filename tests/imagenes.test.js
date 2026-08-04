@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { MAX_BYTES_IMAGEN, resolverConfiguracionCompresion, moverFotoEnLista, subirFotoConFallback } from '../src/utils/imagenes.js';
+import { MAX_BYTES_IMAGEN, resolverConfiguracionCompresion, moverFotoEnLista, subirFotoConFallback, subirImagenAFirebaseStorage } from '../src/utils/imagenes.js';
 
 test('reduce la calidad cuando una imagen supera los 15 MB', () => {
   const config = resolverConfiguracionCompresion(20 * 1024 * 1024);
@@ -35,4 +35,29 @@ test('devuelve la misma imagen como fallback cuando la subida falla', async () =
 
   assert.equal(resultado.url, 'data:image/jpeg;base64,abc');
   assert.equal(resultado.usadaComoFallback, true);
+});
+
+test('sube una imagen a storage y devuelve una url pública', async () => {
+  const file = new File(['abc'], 'foto.jpg', { type: 'image/jpeg' });
+  let uploadedRef = null;
+  let uploadedFile = null;
+
+  const resultado = await subirImagenAFirebaseStorage({
+    file,
+    storage: {},
+    refFn: (_storage, ruta) => {
+      uploadedRef = ruta;
+      return { ruta };
+    },
+    uploadBytes: async (ref, fileToUpload) => {
+      uploadedFile = fileToUpload;
+      return ref;
+    },
+    getDownloadURL: async () => 'https://storage.example.com/foto.jpg',
+    userId: 'usuario-1'
+  });
+
+  assert.equal(resultado, 'https://storage.example.com/foto.jpg');
+  assert.equal(uploadedFile, file);
+  assert.match(uploadedRef, /^avistamientos\/usuario-1\//);
 });

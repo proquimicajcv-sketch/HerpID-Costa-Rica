@@ -16,7 +16,23 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
+
+      - name: Validate Vercel Secrets
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          missing=""
+          [[ -z "$VERCEL_TOKEN" ]] && missing="$missing VERCEL_TOKEN"
+          [[ -z "$VERCEL_ORG_ID" ]] && missing="$missing VERCEL_ORG_ID"
+          [[ -z "$VERCEL_PROJECT_ID" ]] && missing="$missing VERCEL_PROJECT_ID"
+          if [[ -n "$missing" ]]; then
+            echo "Missing GitHub Actions secrets:$missing"
+            echo "Go to: https://github.com/proquimicajcv-sketch/HerpID-Costa-Rica/settings/secrets/actions"
+            exit 1
+          fi
 
       - name: Install Vercel CLI
         run: npm install --global vercel@latest

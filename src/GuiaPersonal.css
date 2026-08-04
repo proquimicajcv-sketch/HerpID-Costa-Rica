@@ -1,0 +1,81 @@
+.guia-personal-page {
+  padding: 1.25rem;
+}
+
+.guia-personal-wrapper {
+  width: 100%;
+}
+
+.guia-personal-title {
+  font-size: clamp(1.15rem, 1rem + 1vw, 1.5rem);
+  line-height: 1.25;
+}
+
+.guia-personal-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
+  gap: 1rem;
+}
+
+.guia-personal-card {
+  min-width: 0;
+}
+
+.guia-personal-image-wrap {
+  height: 200px;
+}
+
+.guia-personal-card-content {
+  min-width: 0;
+}
+
+.guia-personal-chip-row {
+  align-items: center;
+}
+
+.guia-personal-meta {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+@media (max-width: 900px) {
+  .guia-personal-page {
+    padding: 1rem;
+  }
+
+  .guia-personal-grid {
+    grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
+  }
+}
+
+@media (max-width: 640px) {
+  .guia-personal-page {
+    padding: 0.8rem;
+  }
+
+  .guia-personal-image-wrap {
+    height: 190px;
+  }
+
+  .guia-personal-admin-actions {
+    flex-direction: column;
+  }
+
+  .guia-personal-admin-actions button {
+    width: 100%;
+  }
+}
+
+@media (max-width: 480px) {
+  .guia-personal-grid {
+    grid-template-columns: 1fr;
+    gap: 0.85rem;
+  }
+
+  .guia-personal-meta {
+    grid-template-columns: 1fr;
+  }
+
+  .guia-personal-card-content {
+    padding: 0.8rem 0.85rem 0.9rem !important;
+  }
+}

@@ -91,3 +91,28 @@ export async function subirFotoConFallback({ dataUrl, ruta, subir }) {
     return { url: dataUrl, usadaComoFallback: true, error };
   }
 }
+
+export async function subirImagenAFirebaseStorage({
+  file,
+  storage,
+  refFn,
+  uploadBytes,
+  getDownloadURL,
+  userId
+}) {
+  if (!file || typeof file !== 'object') {
+    throw new Error('No se recibió un archivo válido para subir.');
+  }
+
+  const extension = String(file.name || '').split('.').pop() || 'jpg';
+  const safeUserId = String(userId || 'anonimo').replace(/[^a-zA-Z0-9_-]/g, '_');
+  const ruta = `avistamientos/${safeUserId}/${Date.now()}.${extension}`;
+
+  const referencia = typeof refFn === 'function' ? refFn(storage, ruta) : null;
+  if (!referencia || typeof uploadBytes !== 'function' || typeof getDownloadURL !== 'function') {
+    throw new Error('No se pudo preparar la subida de la imagen.');
+  }
+
+  await uploadBytes(referencia, file);
+  return getDownloadURL(referencia);
+}

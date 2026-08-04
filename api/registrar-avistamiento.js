@@ -1,5 +1,7 @@
 import { getFirebaseAdmin } from './_lib/firebaseAdmin.js';
 
+const MAX_PREVIEW_DATA_URL_CHARS = 220000;
+
 function parseDataUrl(dataUrl) {
   const raw = String(dataUrl || '');
   const match = raw.match(/^data:([^;]+);base64,(.+)$/);
@@ -18,10 +20,25 @@ function extensionFromContentType(contentType) {
   return 'jpg';
 }
 
+function esDataUrlImagen(value) {
+  return String(value || '').trim().startsWith('data:image/');
+}
+
+function esDataUrlLiviano(value) {
+  const raw = String(value || '').trim();
+  return esDataUrlImagen(raw) && raw.length <= MAX_PREVIEW_DATA_URL_CHARS;
+}
+
 function esErrorBucketNoExiste(error) {
   const msg = String(error?.message || '').toLowerCase();
   const code = Number(error?.code || 0);
-  return code === 404 || msg.includes('no such bucket') || msg.includes('bucket') && msg.includes('not found');
+  return (
+    code === 404 ||
+    msg.includes('no such bucket') ||
+    (msg.includes('bucket') && msg.includes('not found')) ||
+    msg.includes('bucket does not exist') ||
+    msg.includes('specified bucket does not exist')
+  );
 }
 
 function obtenerBucketsCandidatos() {
@@ -82,6 +99,7 @@ async function subirFotoDesdeDataUrl({ adminStorage, dataUrl, userId, index }) {
 
 async function normalizarFotosRegistro({ adminStorage, fotos, userId }) {
   const salida = [];
+  let fotosPendientesStorage = 0;
 
   for (let i = 0; i < (Array.isArray(fotos) ? fotos.length : 0); i += 1) {
     const foto = fotos[i];
@@ -94,12 +112,21 @@ async function normalizarFotosRegistro({ adminStorage, fotos, userId }) {
     }
 
     if (raw.startsWith('data:image/')) {
-      const subida = await subirFotoDesdeDataUrl({ adminStorage, dataUrl: raw, userId, index: i });
-      if (subida) salida.push(subida);
+      try {
+        const subida = await subirFotoDesdeDataUrl({ adminStorage, dataUrl: raw, userId, index: i });
+        if (subida) salida.push(subida);
+        else fotosPendientesStorage += 1;
+      } catch (error) {
+        if (esErrorBucketNoExiste(error)) {
+          fotosPendientesStorage += 1;
+          continue;
+        }
+        throw error;
+      }
     }
   }
 
-  return salida;
+  return { fotosNormalizadas: salida, fotosPendientesStorage };
 }
 
 function json(res, status, payload) {
@@ -116,25 +143,44 @@ export default async function handler(req, res) {
     const payload = req.body || {};
     const { adminDb, adminStorage } = getFirebaseAdmin();
 
-    const fotosNormalizadas = await normalizarFotosRegistro({
+    const { fotosNormalizadas, fotosPendientesStorage } = await normalizarFotosRegistro({
       adminStorage,
       fotos: payload.fotos,
       userId: payload.userId
     });
 
+    const fotosEntrada = Array.isArray(payload.fotos) ? payload.fotos : [];
+    const conteniaDataUrl = fotosEntrada.some((foto) => String(foto || '').trim().startsWith('data:image/'));
+
     const fotoAutorizadaRaw = String(payload.fotoAutorizada || payload.img || '').trim();
     const fotoAutorizadaEsDataUrl = fotoAutorizadaRaw.startsWith('data:image/');
+    const previewLocal = [payload.fotoMiniaturaLocal, payload.fotoAutorizada, payload.img]
+      .map((value) => String(value || '').trim())
+      .find((value) => esDataUrlLiviano(value)) || '';
+
+    const fotosPersistidas = fotosNormalizadas.length > 0
+      ? fotosNormalizadas
+      : (previewLocal ? [previewLocal] : []);
+
     const fotoAutorizada = fotoAutorizadaEsDataUrl
-      ? (fotosNormalizadas[0] || '')
+      ? (fotosNormalizadas[0] || previewLocal || '')
       : fotoAutorizadaRaw;
+
+    const fotosStoragePendiente = Boolean(
+      payload.fotosStoragePendiente ||
+      fotosPendientesStorage > 0 ||
+      (conteniaDataUrl && fotosNormalizadas.length === 0)
+    );
 
     const registro = {
       ...payload,
-      fotos: fotosNormalizadas,
+      fotos: fotosPersistidas,
       fotoAutorizada: fotoAutorizada || null,
-      img: (fotoAutorizada || fotosNormalizadas[0] || null),
+      img: (fotoAutorizada || fotosPersistidas[0] || null),
       createdAt: payload.createdAt || Date.now(),
-      estado: payload.estado || 'EN REVISIÓN EXPERTA'
+      estado: payload.estado || 'EN REVISIÓN EXPERTA',
+      fotosStoragePendiente,
+      fotoSubidaAFirebase: !fotosStoragePendiente && fotosPersistidas.length > 0
     };
 
     if (!Array.isArray(registro.fotos) || registro.fotos.length === 0) {

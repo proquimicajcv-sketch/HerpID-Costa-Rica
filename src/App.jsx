@@ -7,8 +7,9 @@ import 'leaflet/dist/leaflet.css';
 import { db, auth, storage } from './firebase';
 import { collection, addDoc, getDocs, doc, updateDoc, deleteDoc, onSnapshot, setDoc, getDoc, query, orderBy, limit, where } from 'firebase/firestore';
 import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, setPersistence, browserLocalPersistence, sendPasswordResetEmail } from 'firebase/auth';
-import { ref, uploadString, getDownloadURL } from 'firebase/storage';
+import { ref, uploadString, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { esRegistroVisibleEnMapa, esRegistroValidado, puedeVerReportesEnMapa } from './utils/registroVisibilidad';
+import GuiaPersonal from './GuiaPersonal';
 import { detectarSubidaRanking } from './utils/ranking';
 import { crearDatosUsuarioFirestore } from './utils/usuarioFirestore';
 import { resolverDestinoEliminacionCuenta } from './utils/usuarioCuenta';
@@ -20,8 +21,9 @@ import { guardarBorradorLogin, cargarBorradorLogin, limpiarBorradorLogin, guarda
 import { estimarAltitudYTemperatura as estimarAltitudYTemperaturaDesdeServicio } from './utils/altitud';
 import { contarMensajesSinLeer } from './utils/mensajesChat';
 import { resolverEspeciesGuiaAutorizadas } from './utils/guiaHerpetologica';
-import { MAX_BYTES_IMAGEN_REPORTE, resolverConfiguracionCompresion, validarTamanoImagen, moverFotoEnLista } from './utils/imagenes';
-import { persistirAvistamientoConFallback } from './utils/reporteEnvio';
+import { MAX_BYTES_IMAGEN_REPORTE, resolverConfiguracionCompresion, validarTamanoImagen, moverFotoEnLista, subirImagenAFirebaseStorage } from './utils/imagenes';
+import { persistirAvistamientoConFallback, prepararPayloadAvistamientoConFotosRemotas } from './utils/reporteEnvio';
+
 
 /* --- DICCIONARIO DE CANTONES DE COSTA RICA (COORDENADAS, ALTITUD Y TEMPERATURA) --- */
 const cantonesCR = {
@@ -613,6 +615,8 @@ export default function App() {
     img: '',
     desc: ''
   });
+  const [imgFileGuia, setImgFileGuia] = useState(null);
+  const [imgFileGuiaEditar, setImgFileGuiaEditar] = useState(null);
 
   const [faqImagenes, setFaqImagenes] = useState(() => cargarFaqImagenes());
   const estiloPreviewFaq = {
@@ -1710,6 +1714,33 @@ export default function App() {
     }
   };
 
+  const dataUrlToFile = async (dataUrl, fileName = 'foto.jpg') => {
+    if (!dataUrl || typeof dataUrl !== 'string') {
+      throw new Error('No se recibió una imagen válida para subir.');
+    }
+
+    const response = await fetch(dataUrl);
+    const blob = await response.blob();
+    return new File([blob], fileName, { type: blob.type || 'image/jpeg' });
+  };
+
+  const guardarImagenCompartida = async (url) => {
+    if (!url || typeof url !== 'string' || !url.startsWith('http')) {
+      return;
+    }
+
+    try {
+      await addDoc(collection(db, 'imagenes_compartidas'), {
+        owner: usuario.id || 'anonimo',
+        url,
+        createdAt: Date.now(),
+        origen: 'reporte'
+      });
+    } catch (error) {
+      console.error('No se pudo registrar la imagen compartida:', error);
+    }
+  };
+
   const comprimirImagen = (file) => {
     return new Promise((resolve, reject) => {
       const validacion = validarTamanoImagen(file);
@@ -1761,6 +1792,63 @@ export default function App() {
         img.onerror = () => reject(new Error('No se pudo leer la imagen.'));
       };
       reader.onerror = () => reject(new Error('No se pudo procesar la imagen.'));
+    });
+  };
+
+  const crearMiniaturaDesdeDataUrl = (dataUrl) => {
+    return new Promise((resolve) => {
+      const raw = String(dataUrl || '').trim();
+      if (!raw.startsWith('data:image/')) {
+        resolve('');
+        return;
+      }
+
+      const img = new Image();
+      img.src = raw;
+      img.onload = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          const maxLado = 340;
+          const maxBytes = 140 * 1024;
+          let width = img.width;
+          let height = img.height;
+
+          if (width > height) {
+            if (width > maxLado) {
+              height = Math.round((maxLado * height) / width);
+              width = maxLado;
+            }
+          } else if (height > maxLado) {
+            width = Math.round((maxLado * width) / height);
+            height = maxLado;
+          }
+
+          canvas.width = Math.max(1, width);
+          canvas.height = Math.max(1, height);
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            resolve('');
+            return;
+          }
+
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+          let calidad = 0.62;
+          let salida = canvas.toDataURL('image/jpeg', calidad);
+          let intentos = 0;
+
+          while (salida.length > maxBytes && intentos < 8) {
+            calidad = Math.max(0.36, calidad - 0.07);
+            salida = canvas.toDataURL('image/jpeg', calidad);
+            intentos += 1;
+          }
+
+          resolve(salida);
+        } catch {
+          resolve('');
+        }
+      };
+      img.onerror = () => resolve('');
     });
   };
 
@@ -1821,7 +1909,29 @@ export default function App() {
       try {
         const fotosPrevisualizadas = await Promise.all(files.slice(0, 3).map(async (file) => {
           const comprimida = await comprimirImagen(file);
-          return comprimida;
+          const archivoParaSubir = comprimida
+            ? await dataUrlToFile(comprimida, file.name || 'foto.jpg')
+            : file;
+
+          try {
+            const urlRemota = await subirImagenAFirebaseStorage({
+              file: archivoParaSubir,
+              storage,
+              refFn: ref,
+              uploadBytes,
+              getDownloadURL,
+              userId: usuario.id || 'anonimo'
+            });
+
+            if (urlRemota) {
+              await guardarImagenCompartida(urlRemota);
+              return urlRemota;
+            }
+          } catch (error) {
+            console.error('No se pudo subir la foto a Storage:', error);
+          }
+
+          return comprimida || '';
         }));
 
         setFotosRegistro((prev) => {
@@ -1936,12 +2046,19 @@ export default function App() {
     if (!formGuia.nombre || !formGuia.especie) {
       return alert('Debe completar al menos el Nombre Común y Nombre Científico.');
     }
+    let imgUrl = formGuia.img || 'https://images.unsplash.com/photo-1534567153574-2b12153a87f0?w=500';
+    if (imgFileGuia) {
+      const ext = imgFileGuia.name.split('.').pop();
+      const storageRef = ref(storage, `guia/${Date.now()}.${ext}`);
+      await uploadBytes(storageRef, imgFileGuia);
+      imgUrl = await getDownloadURL(storageRef);
+    }
     const nueva = {
       nombre: formGuia.nombre.trim(),
       especie: formGuia.especie.trim(),
       tipo: formGuia.tipo,
       esPeligroso: formGuia.esPeligroso,
-      img: formGuia.img || 'https://images.unsplash.com/photo-1534567153574-2b12153a87f0?w=500',
+      img: imgUrl,
       desc: formGuia.desc || 'Especie registrada en la guía oficial.',
       autorizadoPor: 'admin'
     };
@@ -1951,6 +2068,7 @@ export default function App() {
       alert('¡Especie agregada a la Guía Herpetológica!');
       setModalNuevaEspecieGuia(false);
       setFormGuia({ nombre: '', especie: '', tipo: 'Anfibio', esPeligroso: false, img: '', desc: '' });
+      setImgFileGuia(null);
     } catch (e) {
       alert('Error al guardar especie en la nube.');
     }
@@ -1959,6 +2077,13 @@ export default function App() {
   const guardarEdicionEspecieGuia = async () => {
     if (!esAdmin) return alert('⛔ Acción restringida a Administradores.');
     if (!especieGuiaEditando) return;
+    let imgUrl = especieGuiaEditando.img;
+    if (imgFileGuiaEditar) {
+      const ext = imgFileGuiaEditar.name.split('.').pop();
+      const storageRef = ref(storage, `guia/${Date.now()}.${ext}`);
+      await uploadBytes(storageRef, imgFileGuiaEditar);
+      imgUrl = await getDownloadURL(storageRef);
+    }
     try {
       const docRef = doc(db, 'especies_guia', especieGuiaEditando.id);
       await updateDoc(docRef, {
@@ -1966,13 +2091,14 @@ export default function App() {
         especie: especieGuiaEditando.especie.trim(),
         tipo: especieGuiaEditando.tipo,
         esPeligroso: especieGuiaEditando.esPeligroso || false,
-        img: especieGuiaEditando.img,
+        img: imgUrl,
         desc: especieGuiaEditando.desc,
         autorizadoPor: 'admin'
       });
       await cargarGuiaNube();
       alert('¡Ficha de la Guía actualizada!');
       setModalEditarEspecieGuia(false);
+      setImgFileGuiaEditar(null);
     } catch (e) {
       alert('Error al actualizar la ficha.');
     }
@@ -2168,16 +2294,46 @@ export default function App() {
       const provinciaDetectada = buscarProvinciaEnTexto(textoUbicacion) || buscarProvinciaEnTexto(`${textoUbicacion} ${nombreComun} ${nombreCientifico}`) || 'San José';
 
       const fotosBase = fotosRegistro.slice(0, 3).filter(Boolean);
-      const fotosNormalizadas = fotosBase
-        .map((foto) => String(foto || '').trim())
-        .filter(Boolean);
-      const fotosPendientesServidor = fotosNormalizadas.filter((foto) => foto.startsWith('data:image/')).length;
+      const fotosNormalizadas = [];
+      const fotosPendientesServidor = [];
+
+      for (let index = 0; index < fotosBase.length; index += 1) {
+        const foto = String(fotosBase[index] || '').trim();
+        if (!foto) continue;
+
+        if (foto.startsWith('http://') || foto.startsWith('https://')) {
+          fotosNormalizadas.push(foto);
+          continue;
+        }
+
+        if (foto.startsWith('data:image/')) {
+          try {
+            const urlRemota = await subirImagenAFirebaseStorage({
+              file: await dataUrlToFile(foto, `foto-${index + 1}.jpg`),
+              storage,
+              refFn: ref,
+              uploadBytes,
+              getDownloadURL,
+              userId: usuario.id || 'anonimo'
+            });
+            fotosNormalizadas.push(urlRemota || foto);
+          } catch (error) {
+            fotosPendientesServidor.push(foto);
+            fotosNormalizadas.push(foto);
+          }
+        } else {
+          fotosNormalizadas.push(foto);
+        }
+      }
 
       if (fotosNormalizadas.length === 0) {
         throw new Error('⚠️ No se pudieron subir las fotos al almacenamiento. Revisa tu conexión e inténtalo de nuevo con imágenes más livianas.');
       }
 
       const fotoInicial = fotosNormalizadas[fotoPrincipalIndex] || fotosNormalizadas[0] || '';
+      const fotoMiniaturaLocal = fotoInicial.startsWith('data:image/')
+        ? await crearMiniaturaDesdeDataUrl(fotoInicial)
+        : '';
       const fotosOrdenadas = [
         fotoInicial,
         ...fotosNormalizadas.filter((f) => f && f !== fotoInicial)
@@ -2212,21 +2368,26 @@ export default function App() {
         fotos: fotosOrdenadas,
         fotoAutorizada: fotoInicial || null,
         img: fotoInicial || null,
+        fotoMiniaturaLocal: fotoMiniaturaLocal || null,
         fotoPrincipalIndex,
         coords: [latFinal, lngFinal],
         createdAt: Date.now(),
-        fotoSubidaAFirebase: fotosPendientesServidor === 0
+        fotoSubidaAFirebase: fotosPendientesServidor.length === 0
       };
 
       const resultado = await persistirAvistamientoConFallback({
         payload: nuevo,
         guardarRemoto: async (payload) => {
-          const requiereSubidaServidor = Array.isArray(payload?.fotos) && payload.fotos.some((f) => String(f || '').startsWith('data:image/'));
-          if (requiereSubidaServidor) {
-            throw new Error('subida-servidor-requerida');
-          }
+          const payloadNormalizado = await prepararPayloadAvistamientoConFotosRemotas({
+            payload,
+            storage,
+            ref,
+            uploadString,
+            getDownloadURL,
+            userId: usuario.id || 'anonimo'
+          });
 
-          const docRef = await addDoc(collection(db, 'avistamientos'), payload);
+          const docRef = await addDoc(collection(db, 'avistamientos'), payloadNormalizado);
           return { ok: true, id: docRef?.id || null };
         },
         guardarDirecto: async (payload) => {
@@ -2263,7 +2424,10 @@ export default function App() {
       }
       setModalRegistro(false);
     } catch (e) {
-      const mensajeError = e?.message || 'Error al enviar el reporte a la nube.';
+      const mensajeCrudo = String(e?.message || '').trim();
+      const mensajeError = mensajeCrudo === 'subida-servidor-requerida'
+        ? 'No fue posible completar la subida de fotos del reporte. Intenta nuevamente en unos minutos.'
+        : (mensajeCrudo || 'Error al enviar el reporte a la nube.');
       setErrorEnvio(mensajeError);
       alert(mensajeError);
     } finally {
@@ -3139,6 +3303,8 @@ const especiesFiltradasGuia = resolverEspeciesGuiaAutorizadas(especiesGuia).filt
               </MapContainer>
             </div>
           )}
+
+          {tab === 'guia' && <GuiaPersonal esAdmin={false} uid={usuario.isLoggedIn ? (usuario.id || null) : null} scopeId={usuario.isLoggedIn ? (String(usuario.email || usuario.id || '').toLowerCase() || null) : null} />}
         </>
       ) : (
         <>
@@ -3330,7 +3496,9 @@ const especiesFiltradasGuia = resolverEspeciesGuiaAutorizadas(especiesGuia).filt
         </div>
       )}
 
-      {tab === 'guia' && (
+      {tab === 'guia' && <GuiaPersonal esAdmin={esAdmin} uid={usuario.isLoggedIn ? (usuario.id || null) : null} scopeId={usuario.isLoggedIn ? (String(usuario.email || usuario.id || '').toLowerCase() || null) : null} />}
+
+      {tab === 'guia_legacy' && (
         <div style={{ padding: '1.2rem', maxWidth: '800px', margin: '0 auto' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.8rem' }}>
             <h2 style={{ color: '#00FF88', margin: 0 }}>📖 Guía Herpetológica</h2>
@@ -4109,11 +4277,11 @@ const especiesFiltradasGuia = resolverEspeciesGuiaAutorizadas(especiesGuia).filt
                 <div style={{ fontSize: '0.75rem', color: '#8AA398' }}>Total Registros</div>
               </div>
               <div style={{ backgroundColor: '#0F1A16', padding: '1rem', borderRadius: '12px', border: '1px solid #1B2E27', textAlign: 'center' }}>
-                <div style={{ fontSize: '1.5rem', color: '#00C853', fontWeight: 'bold' }}>{registros.filter(r => r.estado === 'VALIDADO').length}</div>
+                <div style={{ fontSize: '1.5rem', color: '#00C853', fontWeight: 'bold' }}>{registros.filter((r) => esRegistroValidado(r.estado)).length}</div>
                 <div style={{ fontSize: '0.75rem', color: '#8AA398' }}>Validados</div>
               </div>
               <div style={{ backgroundColor: '#0F1A16', padding: '1rem', borderRadius: '12px', border: '1px solid #1B2E27', textAlign: 'center' }}>
-                <div style={{ fontSize: '1.5rem', color: '#FFC107', fontWeight: 'bold' }}>{registros.filter(r => r.estado !== 'VALIDADO').length}</div>
+                <div style={{ fontSize: '1.5rem', color: '#FFC107', fontWeight: 'bold' }}>{registros.filter((r) => !esRegistroValidado(r.estado)).length}</div>
                 <div style={{ fontSize: '0.75rem', color: '#8AA398' }}>Pendientes</div>
               </div>
               <div style={{ backgroundColor: '#0F1A16', padding: '1rem', borderRadius: '12px', border: '1px solid #1B2E27', textAlign: 'center' }}>
@@ -4132,7 +4300,7 @@ const especiesFiltradasGuia = resolverEspeciesGuiaAutorizadas(especiesGuia).filt
             ) : registrosFiltradosAdmin.map((reg) => {
               const fotosRevision = construirListaFotosPriorizada(reg);
               const fotoPrevia = fotosRevision[0];
-              const esPendiente = reg.estado !== 'VALIDADO';
+              const esPendiente = !esRegistroValidado(reg.estado);
               const contactoAdmin = obtenerContactoAdminReportante(reg);
               const nombreAdminReportante = String(reg.reportante || '').trim() || 'No disponible';
               return (
@@ -4150,7 +4318,7 @@ const especiesFiltradasGuia = resolverEspeciesGuiaAutorizadas(especiesGuia).filt
                       </div>
                       <span style={{ fontSize: '0.8rem', color: '#00FF88', fontStyle: 'italic', display: 'block' }}>{reg.especie}</span>
                       <div style={{ fontSize: '0.75rem', color: '#8AA398' }}>📍 {reg.ubicacion} | 🌐 {reg.coords?.[0]}, {reg.coords?.[1]}</div>
-                      <div style={{ fontSize: '0.72rem', color: reg.estado === 'VALIDADO' ? '#00FF88' : '#FFC107', marginTop: '0.1rem' }}>Estado: {reg.estado}</div>
+                      <div style={{ fontSize: '0.72rem', color: esRegistroValidado(reg.estado) ? '#00FF88' : '#FFC107', marginTop: '0.1rem' }}>Estado: {reg.estado}</div>
                       {esAdmin && (
                         <>
                           <div style={{ fontSize: '0.72rem', color: '#D7EBDD', marginTop: '0.15rem' }}>👤 Reportante: {nombreAdminReportante}</div>
@@ -4433,7 +4601,9 @@ const especiesFiltradasGuia = resolverEspeciesGuiaAutorizadas(especiesGuia).filt
               ⚠️ Especie Venenosa / Peligro Médico
             </label>
 
-            <input type="text" placeholder="URL de la Imagen (Link web)" value={formGuia.img} onChange={(e) => setFormGuia({ ...formGuia, img: e.target.value })} style={{ width: '100%', padding: '0.65rem', backgroundColor: '#050A08', color: '#FFF', border: '1px solid #1B3D2F', borderRadius: '8px', marginBottom: '0.8rem', boxSizing: 'border-box' }} /> 
+            <label style={{ color: '#8AA398', fontSize: '0.8rem', display: 'block', marginBottom: '0.4rem' }}>Imagen de la especie</label>
+            <input type="file" accept="image/*" onChange={(e) => setImgFileGuia(e.target.files[0] || null)} style={{ width: '100%', padding: '0.5rem', backgroundColor: '#050A08', color: '#FFF', border: '1px solid #1B3D2F', borderRadius: '8px', marginBottom: '0.4rem', boxSizing: 'border-box', cursor: 'pointer' }} />
+            {imgFileGuia && <img src={URL.createObjectURL(imgFileGuia)} alt="preview" style={{ width: '100%', height: '120px', objectFit: 'cover', borderRadius: '8px', marginBottom: '0.8rem' }} />}
             <textarea placeholder="Descripción biológica o notas..." value={formGuia.desc} onChange={(e) => setFormGuia({ ...formGuia, desc: e.target.value })} style={{ width: '100%', height: '80px', padding: '0.65rem', backgroundColor: '#050A08', color: '#FFF', border: '1px solid #1B3D2F', borderRadius: '8px', marginBottom: '1rem', boxSizing: 'border-box' }}></textarea>
 
             <button onClick={guardarNuevaEspecieGuia} style={{ width: '100%', padding: '0.85rem', backgroundColor: '#00E676', color: '#000', fontWeight: 'bold', border: 'none', borderRadius: '10px', cursor: 'pointer', fontSize: '1rem' }}>Guardar en la Guía</button>
@@ -4460,7 +4630,10 @@ const especiesFiltradasGuia = resolverEspeciesGuiaAutorizadas(especiesGuia).filt
               ⚠️ Especie Venenosa / Peligro Médico
             </label>
 
-            <input type="text" value={especieGuiaEditando.img || ''} onChange={(e) => setEspecieGuiaEditando({ ...especieGuiaEditando, img: e.target.value })} style={{ width: '100%', padding: '0.65rem', backgroundColor: '#050A08', color: '#FFF', border: '1px solid #1B3D2F', borderRadius: '8px', marginBottom: '0.8rem', boxSizing: 'border-box' }} /> 
+            <label style={{ color: '#8AA398', fontSize: '0.8rem', display: 'block', marginBottom: '0.4rem' }}>Cambiar imagen (opcional)</label>
+            {especieGuiaEditando.img && !imgFileGuiaEditar && <img src={especieGuiaEditando.img} alt="actual" style={{ width: '100%', height: '120px', objectFit: 'cover', borderRadius: '8px', marginBottom: '0.5rem' }} />}
+            <input type="file" accept="image/*" onChange={(e) => setImgFileGuiaEditar(e.target.files[0] || null)} style={{ width: '100%', padding: '0.5rem', backgroundColor: '#050A08', color: '#FFF', border: '1px solid #1B3D2F', borderRadius: '8px', marginBottom: '0.4rem', boxSizing: 'border-box', cursor: 'pointer' }} />
+            {imgFileGuiaEditar && <img src={URL.createObjectURL(imgFileGuiaEditar)} alt="preview" style={{ width: '100%', height: '120px', objectFit: 'cover', borderRadius: '8px', marginBottom: '0.8rem' }} />}
             <textarea value={especieGuiaEditando.desc || ''} onChange={(e) => setEspecieGuiaEditando({ ...especieGuiaEditando, desc: e.target.value })} style={{ width: '100%', height: '80px', padding: '0.65rem', backgroundColor: '#050A08', color: '#FFF', border: '1px solid #1B3D2F', borderRadius: '8px', marginBottom: '1rem', boxSizing: 'border-box' }}></textarea>
 
             <button onClick={guardarEdicionEspecieGuia} style={{ width: '100%', padding: '0.85rem', backgroundColor: '#00E676', color: '#000', fontWeight: 'bold', border: 'none', borderRadius: '10px', cursor: 'pointer', fontSize: '1rem' }}>Actualizar Guía</button>
@@ -4987,7 +5160,7 @@ const especiesFiltradasGuia = resolverEspeciesGuiaAutorizadas(especiesGuia).filt
         <button onClick={() => { if (!usuario.isLoggedIn) { setVistaPerfil('login'); setModalPerfil(true); } else setTab('ranking'); }} style={{ flex: 1, background: 'transparent', border: 'none', color: tab === 'ranking' ? '#00FF88' : '#6A8A7D', cursor: 'pointer', fontSize: '0.75rem', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
           <span style={{ fontSize: '1.2rem' }}>🏆</span> Ranking
         </button>
-        <button onClick={() => { if (!usuario.isLoggedIn) { setVistaPerfil('login'); setModalPerfil(true); } else setTab('guia'); }} style={{ flex: 1, background: 'transparent', border: 'none', color: tab === 'guia' ? '#00FF88' : '#6A8A7D', cursor: 'pointer', fontSize: '0.75rem', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+        <button onClick={() => setTab('guia')} style={{ flex: 1, background: 'transparent', border: 'none', color: tab === 'guia' ? '#00FF88' : '#6A8A7D', cursor: 'pointer', fontSize: '0.75rem', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
           <span style={{ fontSize: '1.2rem' }}>📖</span> Guía
         </button>
         <button onClick={() => { if (!usuario.isLoggedIn) { setVistaPerfil('login'); setModalPerfil(true); } else abrirModalRegistro(); }} style={{ backgroundColor: '#00E676', border: '4px solid #070D0B', color: '#000', width: '56px', height: '56px', borderRadius: '50%', fontSize: '2rem', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', marginTop: '-28px', boxShadow: '0 0 15px rgba(0,230,118,0.5)' }}>
