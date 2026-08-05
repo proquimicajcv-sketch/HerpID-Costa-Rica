@@ -2,12 +2,14 @@ import React, { useEffect, useMemo, useState } from 'react';
 import ReactQuill from 'react-quill';
 import 'react-quill/dist/quill.snow.css';
 import { db } from './firebase';
-import { addDoc, collection, deleteDoc, doc, onSnapshot, serverTimestamp, setDoc, updateDoc } from 'firebase/firestore';
+import { collection, deleteDoc, doc, getDocs, onSnapshot, serverTimestamp, setDoc } from 'firebase/firestore';
 
 const COLECCION_GUIA_MANUAL = 'guia_especies_manual';
+const COLECCION_GUIA_PUBLICA = 'especies_guia';
 
 const LOCAL_INSTALL_ID_KEY = 'herpid_install_id_v1';
 const LOCAL_VISTOS_PREFIX = 'herpid_guia_vistos_';
+const LOCAL_GUIA_CACHE_KEY = 'herpid_guia_especies_cache_v1';
 
 function generarIdInstalacion() {
   return `inst_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
@@ -46,6 +48,47 @@ function guardarVistosLocal(clave, vistos) {
   }
 }
 
+function leerEspeciesCache() {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem(LOCAL_GUIA_CACHE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function guardarEspeciesCache(especies) {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem(LOCAL_GUIA_CACHE_KEY, JSON.stringify(especies));
+  } catch {
+    // Ignorar errores de cache.
+  }
+}
+
+function normalizarEspecieManual(item) {
+  const data = item.data() || {};
+  return {
+    id: String(item.id),
+    nombreComun: String(data.nombreComun || data.nombre || 'Sin nombre'),
+    imagenUrl: String(data.imagenUrl || data.img || ''),
+    descripcionHtml: String(data.descripcionHtml || data.desc || ''),
+  };
+}
+
+function normalizarEspeciePublica(item) {
+  const data = item.data() || {};
+  return {
+    id: String(item.id),
+    nombreComun: String(data.nombreComun || data.nombre || 'Sin nombre'),
+    imagenUrl: String(data.imagenUrl || data.img || ''),
+    descripcionHtml: String(data.descripcionHtml || data.desc || ''),
+  };
+}
+
 function htmlTieneContenido(html) {
   const limpio = String(html || '')
     .replace(/<[^>]*>/g, '')
@@ -81,7 +124,7 @@ export default function GuiaPersonal({ esAdmin = false, canEditAlways = false, u
     return base || 'inst_fallback';
   }, [scopeId, uid, scopeLocal]);
 
-  const [especiesSemanales, setEspeciesSemanales] = useState([]);
+  const [especiesSemanales, setEspeciesSemanales] = useState(() => leerEspeciesCache());
   const [cargandoEspecies, setCargandoEspecies] = useState(true);
   const [formNombre, setFormNombre] = useState('');
   const [formImagenUrl, setFormImagenUrl] = useState('');
@@ -91,27 +134,33 @@ export default function GuiaPersonal({ esAdmin = false, canEditAlways = false, u
   const [vistos, setVistos] = useState(() => leerVistosLocal(claveVistos));
   const [guardandoVisto, setGuardandoVisto] = useState(false);
 
+  const cargarDesdeRespaldoPublico = async () => {
+    try {
+      const snap = await getDocs(collection(db, COLECCION_GUIA_PUBLICA));
+      const lista = snap.docs.map(normalizarEspeciePublica).filter((item) => item.nombreComun);
+      setEspeciesSemanales(lista);
+      guardarEspeciesCache(lista);
+    } catch {
+      const cache = leerEspeciesCache();
+      setEspeciesSemanales(cache);
+    } finally {
+      setCargandoEspecies(false);
+    }
+  };
+
   useEffect(() => {
     const unsubscribe = onSnapshot(
       collection(db, COLECCION_GUIA_MANUAL),
       (snap) => {
-        const lista = snap.docs.map((item) => {
-          const data = item.data() || {};
-          return {
-            id: String(item.id),
-            nombreComun: String(data.nombreComun || 'Sin nombre'),
-            imagenUrl: String(data.imagenUrl || ''),
-            descripcionHtml: String(data.descripcionHtml || ''),
-          };
-        });
+        const lista = snap.docs.map(normalizarEspecieManual).filter((item) => item.nombreComun);
 
         setEspeciesSemanales(lista);
+        guardarEspeciesCache(lista);
         setCargandoEspecies(false);
       },
       (error) => {
         console.error('Error leyendo guía manual:', error);
-        setEspeciesSemanales([]);
-        setCargandoEspecies(false);
+        cargarDesdeRespaldoPublico();
       }
     );
 
@@ -205,21 +254,29 @@ export default function GuiaPersonal({ esAdmin = false, canEditAlways = false, u
 
     setGuardandoAdmin(true);
     try {
-      if (editandoId) {
-        await updateDoc(doc(db, COLECCION_GUIA_MANUAL, editandoId), {
-          nombreComun: nombre,
-          imagenUrl: imagen,
-          descripcionHtml: descripcion,
+      const especieId = editandoId || doc(collection(db, COLECCION_GUIA_MANUAL)).id;
+      const payloadComun = {
+        nombreComun: nombre,
+        imagenUrl: imagen,
+        descripcionHtml: descripcion,
+      };
+
+      await Promise.all([
+        setDoc(doc(db, COLECCION_GUIA_MANUAL, especieId), {
+          ...payloadComun,
           actualizadoEn: serverTimestamp(),
-        });
-      } else {
-        await addDoc(collection(db, COLECCION_GUIA_MANUAL), {
-          nombreComun: nombre,
-          imagenUrl: imagen,
-          descripcionHtml: descripcion,
-          creadoEn: serverTimestamp(),
-        });
-      }
+          ...(editandoId ? {} : { creadoEn: serverTimestamp() }),
+        }, { merge: true }),
+        setDoc(doc(db, COLECCION_GUIA_PUBLICA, especieId), {
+          ...payloadComun,
+          nombre: nombre,
+          img: imagen,
+          desc: descripcion,
+          autorizadoPor: 'admin_general_principal',
+          actualizadoEn: serverTimestamp(),
+          ...(editandoId ? {} : { creadoEn: serverTimestamp() }),
+        }, { merge: true })
+      ]);
 
       limpiarFormularioAdmin();
     } catch (error) {
@@ -240,7 +297,16 @@ export default function GuiaPersonal({ esAdmin = false, canEditAlways = false, u
     if (!confirmar) return;
 
     try {
-      await deleteDoc(doc(db, COLECCION_GUIA_MANUAL, id));
+      const resultados = await Promise.allSettled([
+        deleteDoc(doc(db, COLECCION_GUIA_MANUAL, id)),
+        deleteDoc(doc(db, COLECCION_GUIA_PUBLICA, id))
+      ]);
+
+      const errorPrincipal = resultados[0]?.status === 'rejected';
+      if (errorPrincipal) {
+        throw new Error('No se pudo eliminar en la colección principal.');
+      }
+
       if (editandoId === id) {
         limpiarFormularioAdmin();
       }
