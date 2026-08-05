@@ -89,6 +89,15 @@ function normalizarEspeciePublica(item) {
   };
 }
 
+function normalizarEspecieDesdeApi(item) {
+  return {
+    id: String(item?.id || ''),
+    nombreComun: String(item?.nombreComun || item?.nombre || 'Sin nombre'),
+    imagenUrl: String(item?.imagenUrl || item?.img || ''),
+    descripcionHtml: String(item?.descripcionHtml || item?.desc || ''),
+  };
+}
+
 function htmlTieneContenido(html) {
   const limpio = String(html || '')
     .replace(/<[^>]*>/g, '')
@@ -138,8 +147,25 @@ export default function GuiaPersonal({ esAdmin = false, canEditAlways = false, u
     try {
       const snap = await getDocs(collection(db, COLECCION_GUIA_PUBLICA));
       const lista = snap.docs.map(normalizarEspeciePublica).filter((item) => item.nombreComun);
-      setEspeciesSemanales(lista);
-      guardarEspeciesCache(lista);
+      if (lista.length > 0) {
+        setEspeciesSemanales(lista);
+        guardarEspeciesCache(lista);
+        return;
+      }
+
+      const response = await fetch('/api/guia-especies-publica');
+      const data = await response.json();
+      const desdeApi = Array.isArray(data?.especies)
+        ? data.especies.map(normalizarEspecieDesdeApi).filter((item) => item.nombreComun)
+        : [];
+
+      if (desdeApi.length > 0) {
+        setEspeciesSemanales(desdeApi);
+        guardarEspeciesCache(desdeApi);
+      } else {
+        const cache = leerEspeciesCache();
+        setEspeciesSemanales(cache);
+      }
     } catch {
       const cache = leerEspeciesCache();
       setEspeciesSemanales(cache);
@@ -149,22 +175,38 @@ export default function GuiaPersonal({ esAdmin = false, canEditAlways = false, u
   };
 
   useEffect(() => {
+    let intervalId = null;
+
     const unsubscribe = onSnapshot(
       collection(db, COLECCION_GUIA_MANUAL),
       (snap) => {
         const lista = snap.docs.map(normalizarEspecieManual).filter((item) => item.nombreComun);
 
-        setEspeciesSemanales(lista);
-        guardarEspeciesCache(lista);
+        if (lista.length > 0) {
+          setEspeciesSemanales(lista);
+          guardarEspeciesCache(lista);
+        } else {
+          cargarDesdeRespaldoPublico();
+        }
         setCargandoEspecies(false);
       },
       (error) => {
         console.error('Error leyendo guía manual:', error);
         cargarDesdeRespaldoPublico();
+        if (!intervalId) {
+          intervalId = window.setInterval(() => {
+            cargarDesdeRespaldoPublico();
+          }, 15000);
+        }
       }
     );
 
-    return () => unsubscribe();
+    return () => {
+      unsubscribe();
+      if (intervalId) {
+        window.clearInterval(intervalId);
+      }
+    };
   }, []);
 
   useEffect(() => {

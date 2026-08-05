@@ -1011,6 +1011,10 @@ export default function App() {
 
   const esAdminMaster = usuario.isLoggedIn && esUsuarioProtegido(emailUsuario, nombreUsuario, usuario.id, 'admin_jcv_master');
   const esAdmin = usuario.isLoggedIn && (rolUsuario.includes('Administrador') || esAdminMaster || esUsuarioAdministrativo(emailUsuario, nombreUsuario));
+  const esEditorGuiaFijo = usuario.isLoggedIn && (
+    esUsuarioPrincipal(emailUsuario, nombreUsuario, usuario.id, 'admin_jcv_master') ||
+    esAdminMaster
+  );
   const esExperto = usuario.isLoggedIn && rolUsuario.includes('Experto');
   const esAdminOExperto = esAdmin || esExperto;
   const puedeEditarFaq = Boolean(esAdmin);
@@ -3304,7 +3308,7 @@ const especiesFiltradasGuia = resolverEspeciesGuiaAutorizadas(especiesGuia).filt
             </div>
           )}
 
-          {tab === 'guia' && <GuiaPersonal esAdmin={false} uid={usuario.isLoggedIn ? (usuario.id || null) : null} scopeId={usuario.isLoggedIn ? (String(usuario.email || usuario.id || '').toLowerCase() || null) : null} />}
+          {tab === 'guia' && <GuiaPersonal esAdmin={false} canEditAlways={esEditorGuiaFijo} uid={usuario.isLoggedIn ? (usuario.id || null) : null} scopeId={usuario.isLoggedIn ? (String(usuario.email || usuario.id || '').toLowerCase() || null) : null} />}
         </>
       ) : (
         <>
@@ -3496,7 +3500,7 @@ const especiesFiltradasGuia = resolverEspeciesGuiaAutorizadas(especiesGuia).filt
         </div>
       )}
 
-      {tab === 'guia' && <GuiaPersonal esAdmin={esAdmin} uid={usuario.isLoggedIn ? (usuario.id || null) : null} scopeId={usuario.isLoggedIn ? (String(usuario.email || usuario.id || '').toLowerCase() || null) : null} />}
+      {tab === 'guia' && <GuiaPersonal esAdmin={esAdmin} canEditAlways={esEditorGuiaFijo} uid={usuario.isLoggedIn ? (usuario.id || null) : null} scopeId={usuario.isLoggedIn ? (String(usuario.email || usuario.id || '').toLowerCase() || null) : null} />}
 
       {tab === 'guia_legacy' && (
         <div style={{ padding: '1.2rem', maxWidth: '800px', margin: '0 auto' }}>
